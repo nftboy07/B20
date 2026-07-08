@@ -64,3 +64,49 @@ python b20_mainnet_sniper.py --live --create-b20 --salt "your-unique-salt"
 4. For private submission, configure a suitable private / builder RPC.
 
 Use at your own risk. Gas is real. Slippages on launch pools are brutal.
+
+## VPS Deployment (using b20.pem)
+1. On your local machine (with the PEM):
+   ```powershell
+   # Replace USER and IP with your Lightsail/AWS instance details (common users: ubuntu, root, admin)
+   $KEY = "C:\Users\91907\Downloads\b20.pem"
+   $VPS = "ubuntu@YOUR_VPS_IP_HERE"
+
+   # Fix key perms if needed (run once)
+   icacls $KEY /inheritance:r /grant:r "$env:USERNAME:(R)"
+
+   # Copy the project
+   scp -i $KEY -r C:\Users\91907\B20-repo $VPS:/root/b20-bot   # or /home/ubuntu/b20-bot
+
+   # SSH in
+   ssh -i $KEY $VPS
+   ```
+
+2. On the VPS:
+   ```bash
+   cd /root/b20-bot   # adjust path
+   sudo apt update && sudo apt install -y python3-venv python3-pip git
+   python3 -m venv venv
+   source venv/bin/activate
+   pip install -r requirements.txt
+
+   # Create .env with REAL values (use editor or scp a prepared .env)
+   cp .env.example .env
+   nano .env   # set RPC_URL (Alchemy/Infura recommended), PRIVATE_KEY, etc.
+   ```
+
+3. Run persistently:
+   ```bash
+   # Using tmux (recommended)
+   tmux new -s b20
+   source venv/bin/activate
+   python b20_mainnet_sniper.py --monitor     # or with --live when ready
+
+   # Detach: Ctrl+B then D
+   # Reattach later: tmux attach -t b20
+   ```
+
+   Or use nohup / systemd for production.
+
+**Security:** Never put your main wallet private key on a long-lived VPS without additional protections. Consider a dedicated sniper wallet with limited funds. Use a private RPC. Monitor logs.
+
