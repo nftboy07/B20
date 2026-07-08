@@ -315,9 +315,9 @@ def tg_send(message: str, reply_markup: dict = None):
     except Exception as e:
         print(f"[TG] notify failed: {e}")
 
-def check_tg_commands(cfg: dict):
+def check_tg_commands(cfg: dict, w3=None):
     """TG commands with inline buttons for control.
-    Supports /start to show buttons, and callback buttons for pause/resume/status.
+    Supports /start to show buttons, and callback buttons for pause/resume/status + buy buttons.
     Uses offset file to avoid reprocessing updates.
     """
     token = cfg.get("TG_BOT_TOKEN", "")
@@ -364,6 +364,20 @@ def check_tg_commands(cfg: dict):
                 elif data == "kill":
                     open(cfg.get("KILL_SWITCH_FILE", "/tmp/kill"), 'a').close()
                     tg_send("🛑 Kill switch activated.")
+                elif data.startswith("buy_"):
+                    try:
+                        _, tkn, amt_str = data.split("_", 2)
+                        amt = float(amt_str)
+                        if w3:
+                            tg_send(f"Executing buy {amt} ETH on {tkn}...")
+                            # Try common fees
+                            f = 3000
+                            p = find_or_wait_pool(w3, WETH, tkn, f) or find_or_wait_pool(w3, tkn, WETH, f)
+                            if not p:
+                                f = 10000
+                            attempt_buy(w3, tkn, f, amt, cfg, max_retries=1)
+                    except Exception as be:
+                        tg_send(f"Buy button error: {be}")
 
                 continue
 
@@ -516,6 +530,20 @@ def check_b20_activated(w3: Web3, want_stable: bool = False) -> bool:
 
 def get_b20_factory(w3: Web3):
     return w3.eth.contract(address=B20_FACTORY, abi=B20_FACTORY_ABI)
+
+def get_token_name_symbol(w3: Web3, token_addr: str):
+    """Fetch name and symbol for a token (ERC20 standard)."""
+    try:
+        abi = [
+            {"constant": True, "inputs": [], "name": "name", "outputs": [{"name": "", "type": "string"}], "type": "function"},
+            {"constant": True, "inputs": [], "name": "symbol", "outputs": [{"name": "", "type": "string"}], "type": "function"},
+        ]
+        c = w3.eth.contract(address=to_checksum_address(token_addr), abi=abi)
+        name = c.functions.name().call()
+        sym = c.functions.symbol().call()
+        return name[:30], sym[:10]  # truncate
+    except Exception:
+        return "Unknown", "UNK"
 
 def check_recent_b20_creations(w3: Web3, last_block: int, current_block: int) -> list:
     """Early signal from B20Factory (one of the top upgrades for chasing memes)."""
@@ -958,6 +986,19 @@ def monitor_new_pools_and_snipe(w3: Web3, buy_amount_eth: float = 0.05, cfg: dic
                         if new_token.lower().startswith("0xb20") or is_b20:
                             print(f"Detected likely B20 token: {new_token} (isB20={is_b20})")
 
+                            name, sym = get_token_name_symbol(w3, new_token)
+                            msg = f"🆕 <b>{name} ({sym})</b>\n<code>{new_token}</code>\nPool: <code>{pool}</code> fee={fee}"
+
+                            buttons = {
+                                "inline_keyboard": [
+                                    [{"text": "Buy 0.003 ETH", "callback_data": f"buy_{new_token}_0.003"}],
+                                    [{"text": "Buy 0.005 ETH", "callback_data": f"buy_{new_token}_0.005"}],
+                                    [{"text": "Buy 0.007 ETH", "callback_data": f"buy_{new_token}_0.007"}],
+                                    [{"text": "Buy 0.01 ETH", "callback_data": f"buy_{new_token}_0.01"}],
+                                ]
+                            }
+                            tg_send(msg, reply_markup=buttons)
+
                         # Automatic small amount sniping - no pool alerts
                         if dry_run or not activated:
                             print(f"[{'DRY RUN' if dry_run else 'WAITING ACTIVATION'}] Would snipe {new_token} with {SNIPE_AMOUNT_ETH} ETH")
@@ -976,8 +1017,7 @@ def monitor_new_pools_and_snipe(w3: Web3, buy_amount_eth: float = 0.05, cfg: dic
             time.sleep(5)  # Increased sleep to reduce rate limits on public RPCs
 
             # Check for TG commands every loop
-            if 'check_tg_commands' in dir():
-                check_tg_commands(cfg)
+            check_tg_commands(cfg, w3)
 
         except KeyboardInterrupt:
             print("Monitor stopped by user.")
