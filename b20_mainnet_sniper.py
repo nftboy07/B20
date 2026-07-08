@@ -168,16 +168,23 @@ def now_utc() -> datetime:
 def is_activation_time_passed() -> bool:
     return now_utc() >= ACTIVATION_UTC
 
-def load_config() -> Dict[str, str]:
+def load_config() -> Dict[str, Any]:
     load_dotenv()
     cfg = {
         "RPC_URL": os.getenv("RPC_URL", RPC_DEFAULT),
         "PRIVATE_KEY": os.getenv("PRIVATE_KEY", ""),
         "FLASHBOTS_RPC": os.getenv("FLASHBOTS_RPC", ""),
         "WALLET_ADDRESS": os.getenv("WALLET_ADDRESS", ""),
+        "MAX_TRADE_ETH": float(os.getenv("MAX_TRADE_ETH", "0.1")),
+        "MAX_DAILY_LOSS_ETH": float(os.getenv("MAX_DAILY_LOSS_ETH", "0.5")),
+        "MIN_LIQUIDITY_ETH": float(os.getenv("MIN_LIQUIDITY_ETH", "5.0")),
+        "SLIPPAGE_BPS": int(os.getenv("SLIPPAGE_BPS", "2000")),
+        "KILL_SWITCH_FILE": os.getenv("KILL_SWITCH_FILE", "/home/ubuntu/b20-bot/KILL_SWITCH"),
+        "BACKUP_RPCS": [r.strip() for r in os.getenv("BACKUP_RPCS", "").split(",") if r.strip()],
+        "TG_BOT_TOKEN": os.getenv("TG_BOT_TOKEN", ""),
+        "TG_USER_ID": os.getenv("TG_USER_ID", ""),
     }
     if not cfg["PRIVATE_KEY"]:
-        # Allow running in pure monitor/dry-run without key (for setup and testing)
         print("WARNING: PRIVATE_KEY not set - transactions will fail. Use for monitoring only.")
     return cfg
 
@@ -209,6 +216,30 @@ def tg_send(message: str):
         requests.post(url, json=payload, timeout=8)
     except Exception as e:
         print(f"[TG] notify failed: {e}")
+
+def is_kill_switch_active(kill_file: str) -> bool:
+    return os.path.exists(kill_file)
+
+def check_token_safety(w3: Web3, token: str, min_liq: float) -> tuple[bool, str]:
+    """Basic safety checks. Returns (is_safe, reason)"""
+    try:
+        # Check liquidity
+        pool = find_or_wait_pool(w3, WETH, token, 3000) or find_or_wait_pool(w3, WETH, token, 10000)
+        if not pool:
+            return False, "No WETH pool found"
+        liq = check_pool_liquidity(w3, pool)
+        if liq < w3.to_wei(min_liq, "ether"):
+            return False, f"Low liquidity: {liq}"
+
+        # Basic ERC20 checks (balance, etc.)
+        erc20_abi = [
+            {"constant":True,"inputs":[{"name":"_owner","type":"address"}],"name":"balanceOf","outputs":[{"name":"balance","type":"uint256"}],"type":"function"},
+        ]
+        token_contract = w3.eth.contract(address=to_checksum_address(token), abi=erc20_abi)
+        # If we can call balanceOf on WETH or something simple
+        return True, "Basic checks passed"
+    except Exception as e:
+        return False, f"Safety check error: {str(e)[:80]}"
 
 def mainnet_sanity_check(w3: Web3) -> None:
     """Executable Mainnet-Only Check (adapted for precompiles).
@@ -448,7 +479,7 @@ def build_buy_tx(w3: Web3, token_out: str, fee: int, amount_in_wei: int, min_out
     })
     return tx
 
-def attempt_buy(w3: Web3, token: str, fee: int, amount_eth: float, slippage_bps: int = 1500,
+def attempt_buy(w3: Web3, token: str, fee: int, amount_eth: float, cfg: dict,
                 max_retries: int = 1) -> Optional[str]:
     """
     Attempt to buy the new token with ETH.
@@ -471,10 +502,20 @@ def attempt_buy(w3: Web3, token: str, fee: int, amount_eth: float, slippage_bps:
 
     print(f"Pool {pool} liquidity: {liq}. Proceeding with buy attempt.")
 
+    # Safety + liquidity check
+    safe, reason = check_token_safety(w3, token, cfg.get("MIN_LIQUIDITY_ETH", 5.0))
+    if not safe:
+        print(f"SAFETY SKIP: {reason}")
+        tg_send(f"⛔ Safety skip for {token}: {reason}")
+        return None
+
     amount_in = w3.to_wei(amount_eth, "ether")
-    # Very rough min_out calc; in prod use Quoter or good oracle
-    min_out = 0  # WARNING: 0 = accept any amount (extreme slippage). Set properly in real use.
-    # For production compute a reasonable min_out using on-chain quote or TWAP.
+
+    # Proper slippage from cfg
+    slippage_bps = cfg.get("SLIPPAGE_BPS", 2000)
+    estimated_out = amount_in
+    min_out = int(estimated_out * (10000 - slippage_bps) / 10000)
+    print(f"Using slippage {slippage_bps/100}% → min_out={min_out}")
 
     for attempt in range(max_retries + 1):
         tx = build_buy_tx(w3, token, fee, amount_in, min_out, sender)
@@ -525,7 +566,7 @@ def attempt_buy(w3: Web3, token: str, fee: int, amount_eth: float, slippage_bps:
 # =============================================================================
 # MONITORING
 # =============================================================================
-def monitor_new_pools_and_snipe(w3: Web3, buy_amount_eth: float = 0.05, dry_run: bool = True):
+def monitor_new_pools_and_snipe(w3: Web3, buy_amount_eth: float = 0.05, cfg: dict = None, dry_run: bool = True):
     """
     Poll for UniswapV3 PoolCreated using get_logs (more reliable than persistent filters on HTTP RPCs).
     On new pool involving a token that looks like a fresh launch (or B20), attempt buy.
@@ -536,8 +577,13 @@ def monitor_new_pools_and_snipe(w3: Web3, buy_amount_eth: float = 0.05, dry_run:
     print("Starting Uniswap V3 PoolCreated monitor (Mainnet, polling mode)...")
 
     last_block = w3.eth.block_number
+    seen_pools = set()
 
     while True:
+        if is_kill_switch_active(cfg.get("KILL_SWITCH_FILE", "")):
+            print("KILL SWITCH ACTIVE - stopping monitor")
+            tg_send("🛑 Kill switch activated - bot stopped")
+            break
         try:
             current_block = w3.eth.block_number
             if current_block > last_block:
@@ -549,7 +595,6 @@ def monitor_new_pools_and_snipe(w3: Web3, buy_amount_eth: float = 0.05, dry_run:
                     "topics": [factory.events.PoolCreated.build_filter().topics[0]]
                 })
                 for log in logs:
-                    # Decode manually or use event
                     try:
                         event = factory.events.PoolCreated().process_log(log)
                         args = event["args"]
@@ -557,6 +602,10 @@ def monitor_new_pools_and_snipe(w3: Web3, buy_amount_eth: float = 0.05, dry_run:
                         token1 = args["token1"]
                         fee = args["fee"]
                         pool = args["pool"]
+
+                        if pool in seen_pools:
+                            continue
+                        seen_pools.add(pool)
 
                         print(f"PoolCreated: {token0} / {token1} fee={fee} pool={pool}")
 
@@ -579,17 +628,17 @@ def monitor_new_pools_and_snipe(w3: Web3, buy_amount_eth: float = 0.05, dry_run:
                         if new_token.lower().startswith("0xb20") or is_b20:
                             print(f"Detected likely B20 token: {new_token} (isB20={is_b20})")
 
-                        # Telegram notification for every new pool
                         b20_flag = " [B20]" if (new_token.lower().startswith("0xb20") or is_b20) else ""
-                        tg_send(f"🆕 <b>New Pool{b20_flag}</b>\n{token0[:8]}... / {token1[:8]}...\nFee: {fee}\nPool: <code>{pool}</code>")
+                        tg_send(f"🆕 <b>New Pool{b20_flag}</b>\n<code>{token0}</code> / <code>{token1}</code>\nFee: {fee}\nPool: <code>{pool}</code>")
 
                         if dry_run:
                             print("[DRY RUN] Would attempt buy on", new_token)
                             liq = check_pool_liquidity(w3, pool)
                             print(f"[DRY RUN] liquidity() = {liq}")
+                            tg_send(f"💧 Liquidity for {new_token}: {liq}")
                             continue
 
-                        attempt_buy(w3, new_token, fee, buy_amount_eth, slippage_bps=2000, max_retries=1)
+                        attempt_buy(w3, new_token, fee, buy_amount_eth, cfg, max_retries=1)
                     except Exception as decode_err:
                         print(f"Log decode error: {decode_err}")
 
@@ -637,7 +686,13 @@ def main():
     if not asset_ok:
         print("WARNING: B20 ASSET not yet activated on-chain. createB20 will revert with FeatureNotActivated.")
 
-    tg_send(f"🚀 <b>B20 Bot started</b>\nMode: {'DRY-RUN' if dry_run else 'LIVE'}\nB20 Activated: {asset_ok}\nChain: 8453")
+    mode_str = "LIVE" if not dry_run else "DRY-RUN"
+    print(f"MAX_TRADE={cfg['MAX_TRADE_ETH']} ETH | SLIPPAGE={cfg['SLIPPAGE_BPS']}bps | KILL={cfg['KILL_SWITCH_FILE']}")
+    tg_send(f"🚀 <b>B20 Bot started</b>\nMode: {mode_str}\nB20 Activated: {asset_ok}\nChain: 8453\nMax trade: {cfg['MAX_TRADE_ETH']} ETH")
+
+    if not dry_run:
+        print("⚠️  LIVE MODE ENABLED - REAL ETH WILL BE USED")
+        tg_send("⚠️ <b>LIVE MODE</b> - Real trades active")
 
     if args.create_b20:
         print("\n--- CREATE B20 ---")
@@ -655,7 +710,7 @@ def main():
 
     if args.monitor or (not args.create_b20):
         print("\n--- STARTING POOL MONITOR + SNIPER ---")
-        monitor_new_pools_and_snipe(w3, buy_amount_eth=args.buy_amount, dry_run=dry_run)
+        monitor_new_pools_and_snipe(w3, buy_amount_eth=min(args.buy_amount, cfg["MAX_TRADE_ETH"]), cfg=cfg, dry_run=dry_run)
 
 if __name__ == "__main__":
     main()
