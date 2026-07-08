@@ -212,12 +212,31 @@ UNISWAP_V3_ROUTER_ABI = [
 
 # Minimal QuoterV2 ABI for accurate quotes (upgrade for real slippage)
 UNISWAP_QUOTER_V2_ABI = [
-    {"inputs": [{"internalType": "bytes", "name": "params", "type": "bytes"}],
-     "name": "quoteExactInputSingle", "outputs": [{"internalType": "uint256", "name": "amountOut", "type": "uint256"},
-                                                  {"internalType": "uint160", "name": "sqrtPriceX96After", "type": "uint160"},
-                                                  {"internalType": "uint32", "name": "initializedTicksCrossed", "type": "uint32"},
-                                                  {"internalType": "uint256", "name": "gasEstimate", "type": "uint256"}],
-     "stateMutability": "nonpayable", "type": "function"}
+    {
+        "inputs": [
+            {
+                "components": [
+                    {"internalType": "address", "name": "tokenIn", "type": "address"},
+                    {"internalType": "address", "name": "tokenOut", "type": "address"},
+                    {"internalType": "uint24", "name": "fee", "type": "uint24"},
+                    {"internalType": "uint256", "name": "amountIn", "type": "uint256"},
+                    {"internalType": "uint160", "name": "sqrtPriceLimitX96", "type": "uint160"}
+                ],
+                "internalType": "struct IQuoterV2.QuoteExactInputSingleParams",
+                "name": "params",
+                "type": "tuple"
+            }
+        ],
+        "name": "quoteExactInputSingle",
+        "outputs": [
+            {"internalType": "uint256", "name": "amountOut", "type": "uint256"},
+            {"internalType": "uint160", "name": "sqrtPriceX96After", "type": "uint160"},
+            {"internalType": "uint32", "name": "initializedTicksCrossed", "type": "uint32"},
+            {"internalType": "uint256", "name": "gasEstimate", "type": "uint256"}
+        ],
+        "stateMutability": "nonpayable",
+        "type": "function"
+    }
 ]
 
 # =============================================================================
@@ -351,11 +370,12 @@ def check_tg_commands(cfg: dict, w3=None):
     while True:
         try:
             import requests
-            url = f"https://api.telegram.org/bot{token}/getUpdates?offset={offset}&limit=10&timeout=2"
-            resp = requests.get(url, timeout=10).json()
+            # Long polling with high timeout for near-instant response when update arrives.
+            # No extra sleep - loop immediately for next poll.
+            url = f"https://api.telegram.org/bot{token}/getUpdates?offset={offset}&limit=10&timeout=20"
+            resp = requests.get(url, timeout=25).json()
 
             if not resp.get("ok") or not resp.get("result"):
-                time.sleep(1)
                 continue
 
             new_offset = offset
@@ -427,7 +447,7 @@ def check_tg_commands(cfg: dict, w3=None):
             offset = new_offset
         except Exception as e:
             print(f"[TG] command poll error: {e}")
-            time.sleep(2)
+            time.sleep(1)
 
 def is_kill_switch_active(kill_file: str) -> bool:
     return os.path.exists(kill_file)
