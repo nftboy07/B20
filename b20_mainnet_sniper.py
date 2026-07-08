@@ -22,8 +22,11 @@ CRITICAL WARNINGS (READ FULLY):
 - You are responsible for your wallet, keys, and funds. 0.5+ ETH recommended minimum.
 - Test thoroughly with eth_call simulations and on testnet if possible BEFORE any live mainnet run.
 - This is NOT financial advice. Trading bots can and will lose money.
-- Never hardcode private keys. Use environment variables or secure secret management.
+- **NEVER hardcode or log private keys/tokens.** All secrets MUST come from .env (which is gitignored).
+- The code explicitly masks keys in logs via mask_sensitive() and get_safe_config().
 - Clock must be NTP-synced to UTC.
+- On VPS always: chmod 600 .env
+- If a secret is ever leaked, rotate it IMMEDIATELY.
 
 Usage:
   1. pip install web3 python-dotenv
@@ -208,6 +211,22 @@ def load_config() -> Dict[str, Any]:
     if not cfg["PRIVATE_KEY"]:
         print("WARNING: PRIVATE_KEY not set - transactions will fail. Use for monitoring only.")
     return cfg
+
+def mask_sensitive(value: str, show_last: int = 4) -> str:
+    """Mask sensitive strings like keys and tokens for logging."""
+    if not value or len(value) < 8:
+        return "***"
+    return value[:4] + "..." + value[-show_last:] if len(value) > 8 else "***"
+
+def get_safe_config(cfg: dict) -> dict:
+    """Return a copy of config with all sensitive values masked. Leak-proof for logs."""
+    safe = cfg.copy()
+    for k in ["PRIVATE_KEY", "TG_BOT_TOKEN", "FLASHBOTS_RPC"]:
+        if k in safe and safe[k]:
+            safe[k] = mask_sensitive(safe[k])
+    if "BACKUP_RPCS" in safe:
+        safe["BACKUP_RPCS"] = [mask_sensitive(r) for r in safe.get("BACKUP_RPCS", [])]
+    return safe
 
 def get_w3(rpc_url: str) -> Web3:
     if rpc_url.startswith("wss://"):
@@ -779,7 +798,9 @@ def main():
         print("WARNING: B20 ASSET not yet activated on-chain. createB20 will revert with FeatureNotActivated.")
 
     mode_str = "LIVE" if not dry_run else "DRY-RUN"
-    print(f"MAX_TRADE={cfg['MAX_TRADE_ETH']} ETH | SLIPPAGE={cfg['SLIPPAGE_BPS']}bps | KILL={cfg['KILL_SWITCH_FILE']}")
+    safe_cfg = get_safe_config(cfg)
+    print(f"MAX_TRADE={safe_cfg['MAX_TRADE_ETH']} ETH | SLIPPAGE={safe_cfg['SLIPPAGE_BPS']}bps | KILL={safe_cfg['KILL_SWITCH_FILE']}")
+    print(f"RPC (masked): {mask_sensitive(safe_cfg['RPC_URL'])}")
     tg_send(f"🚀 <b>B20 Bot started</b>\nMode: {mode_str}\nB20 Activated: {asset_ok}\nChain: 8453\nMax trade: {cfg['MAX_TRADE_ETH']} ETH")
 
     if not dry_run:

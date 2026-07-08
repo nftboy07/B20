@@ -108,7 +108,18 @@ Use at your own risk. Gas is real. Slippages on launch pools are brutal.
 
    Or use nohup / systemd for production.
 
-**Security:** Never put your main wallet private key on a long-lived VPS without additional protections. Consider a dedicated sniper wallet with limited funds. Use a private RPC. Monitor logs.
+**Security (CRITICAL - Leak Proofing):**
+
+- **NEVER** commit real secrets. `.env` and `.env.*` (except `.env.example`) are in `.gitignore`.
+- On VPS: `chmod 600 /home/ubuntu/b20-bot/.env && chown ubuntu:ubuntu /home/ubuntu/b20-bot/.env`
+- Use a **dedicated low-balance wallet** (e.g. 0.2-1 ETH max). Never use your main wallet.
+- The code uses `get_safe_config()` and `mask_sensitive()` — keys are never printed in logs or TG.
+- For production: Consider passing secrets via systemd `EnvironmentFile=` or a secrets manager (e.g. Doppler, AWS Secrets).
+- Check git history before first push: `git log --all --full-history -- "*.env" "*.pem"`
+- If you ever accidentally commit a key, immediately rotate it and purge history with `git filter-repo` or BFG.
+- Run the bot with minimal privileges.
+- Monitor for leaks: `grep -r "0x[0-9a-fA-F]\{32,\}" . --include="*.py" --include="*.sh" --include="*.log"` (should only find contract addresses).
+- TG tokens: Treat `TG_BOT_TOKEN` as sensitive (can be used to spam your bot).
 
 ## Telegram Integration
 Add to `.env`:

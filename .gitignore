@@ -28,9 +28,15 @@ ENV/
 
 # Env files with secrets - NEVER COMMIT
 .env
-.env.local
+.env.*
+!.env.example
 *.pem
 *.key
+id_*
+secrets/
+.env.local
+.env.production
+.env.staging
 
 # Logs
 *.log
