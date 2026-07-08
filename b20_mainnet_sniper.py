@@ -210,6 +210,11 @@ def load_config() -> Dict[str, Any]:
     }
     if not cfg["PRIVATE_KEY"]:
         print("WARNING: PRIVATE_KEY not set - transactions will fail. Use for monitoring only.")
+    # Leak-proof runtime guard
+    if not dry_run and ("YOUR" in cfg.get("PRIVATE_KEY", "") or len(cfg.get("PRIVATE_KEY", "")) < 10):
+        print("ERROR: Looks like a placeholder PRIVATE_KEY. Refusing to run in LIVE mode.")
+        print("Replace in .env with real key, then restart.")
+        sys.exit(1)
     return cfg
 
 def mask_sensitive(value: str, show_last: int = 4) -> str:
