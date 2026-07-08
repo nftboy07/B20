@@ -501,70 +501,78 @@ def attempt_buy(w3: Web3, token: str, fee: int, amount_eth: float, slippage_bps:
 # =============================================================================
 def monitor_new_pools_and_snipe(w3: Web3, buy_amount_eth: float = 0.05, dry_run: bool = True):
     """
-    Subscribe / poll for UniswapV3 PoolCreated.
+    Poll for UniswapV3 PoolCreated using get_logs (more reliable than persistent filters on HTTP RPCs).
     On new pool involving a token that looks like a fresh launch (or B20), attempt buy.
     """
     factory = get_uniswap_v3_factory(w3)
-    print("Starting Uniswap V3 PoolCreated monitor (Mainnet)...")
+    pool_created_topic = factory.events.PoolCreated.build_filter().topics[0]  # approx, use full event
 
-    # For robustness on HTTP RPC we poll recent logs. For production use WS filter.
-    event_filter = factory.events.PoolCreated.create_filter(from_block="latest")
+    print("Starting Uniswap V3 PoolCreated monitor (Mainnet, polling mode)...")
 
     last_block = w3.eth.block_number
 
     while True:
         try:
-            for event in event_filter.get_new_entries():
-                args = event["args"]
-                token0 = args["token0"]
-                token1 = args["token1"]
-                fee = args["fee"]
-                pool = args["pool"]
+            current_block = w3.eth.block_number
+            if current_block > last_block:
+                # Use get_logs for PoolCreated
+                logs = w3.eth.get_logs({
+                    "fromBlock": last_block + 1,
+                    "toBlock": current_block,
+                    "address": UNISWAP_V3_FACTORY,
+                    "topics": [factory.events.PoolCreated.build_filter().topics[0]]
+                })
+                for log in logs:
+                    # Decode manually or use event
+                    try:
+                        event = factory.events.PoolCreated().process_log(log)
+                        args = event["args"]
+                        token0 = args["token0"]
+                        token1 = args["token1"]
+                        fee = args["fee"]
+                        pool = args["pool"]
 
-                print(f"PoolCreated: {token0} / {token1} fee={fee} pool={pool}")
+                        print(f"PoolCreated: {token0} / {token1} fee={fee} pool={pool}")
 
-                # Identify the "new" token (not WETH/USDC)
-                new_token = None
-                if token0.lower() != WETH.lower() and token0.lower() != USDC.lower():
-                    new_token = token0
-                elif token1.lower() != WETH.lower() and token1.lower() != USDC.lower():
-                    new_token = token1
+                        new_token = None
+                        if token0.lower() != WETH.lower() and token0.lower() != USDC.lower():
+                            new_token = token0
+                        elif token1.lower() != WETH.lower() and token1.lower() != USDC.lower():
+                            new_token = token1
 
-                if not new_token:
-                    continue
+                        if not new_token:
+                            continue
 
-                # Prefer B20 tokens (address prefix check)
-                is_b20 = False
-                try:
-                    fac = get_b20_factory(w3)
-                    is_b20 = fac.functions.isB20(to_checksum_address(new_token)).call()
-                except Exception:
-                    pass
+                        is_b20 = False
+                        try:
+                            fac = get_b20_factory(w3)
+                            is_b20 = fac.functions.isB20(to_checksum_address(new_token)).call()
+                        except Exception:
+                            pass
 
-                if new_token.lower().startswith("0xb20") or is_b20:
-                    print(f"Detected likely B20 token: {new_token} (isB20={is_b20})")
+                        if new_token.lower().startswith("0xb20") or is_b20:
+                            print(f"Detected likely B20 token: {new_token} (isB20={is_b20})")
 
-                if dry_run:
-                    print("[DRY RUN] Would attempt buy on", new_token)
-                    # Still check liquidity via eth_call
-                    liq = check_pool_liquidity(w3, pool)
-                    print(f"[DRY RUN] liquidity() = {liq}")
-                    continue
+                        if dry_run:
+                            print("[DRY RUN] Would attempt buy on", new_token)
+                            liq = check_pool_liquidity(w3, pool)
+                            print(f"[DRY RUN] liquidity() = {liq}")
+                            continue
 
-                # Live snipe
-                attempt_buy(w3, new_token, fee, buy_amount_eth, slippage_bps=2000, max_retries=1)
+                        attempt_buy(w3, new_token, fee, buy_amount_eth, slippage_bps=2000, max_retries=1)
+                    except Exception as decode_err:
+                        print(f"Log decode error: {decode_err}")
 
-            # Also poll B20Factory creations directly (even better signal for B20 launches)
-            # (omitted for brevity - add a log filter on B20_FACTORY for B20Created)
+                last_block = current_block
 
-            time.sleep(1.5)  # polite poll interval
+            time.sleep(3)
 
         except KeyboardInterrupt:
             print("Monitor stopped by user.")
             break
         except Exception as e:
             print(f"Monitor error: {e}")
-            time.sleep(3)
+            time.sleep(5)
 
 # =============================================================================
 # MAIN
