@@ -124,3 +124,14 @@ The bot will send notifications for:
 
 Restart after editing: `sudo systemctl restart b20-bot`
 
+## Going Live (Real Mode)
+1. Fund wallet with small test amount first.
+2. Edit .env with real PRIVATE_KEY and risk settings (MAX_TRADE_ETH etc).
+3. To run live: edit service or run manually with --live
+   sudo nano /etc/systemd/system/b20-bot.service
+   # Add --live to ExecStart
+   sudo systemctl daemon-reload
+   sudo systemctl restart b20-bot
+
+See the 20 upgrades in conversation history for full list implemented (slippage, safety, kill switch, risk limits, etc.).
+
