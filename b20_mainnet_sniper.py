@@ -1142,13 +1142,25 @@ def main():
         # Start mempool monitoring in background for early signals if available
         if MEMPOOL_AVAILABLE and not dry_run:
             try:
+                def on_b20_mem(tx, txh, st, name="B20"):
+                    msg = f"🆕 <b>{name}</b> (MEMPOOL EARLY)\n<code>{tx.get('to', 'N/A')}</code>"
+                    buttons = {
+                        "inline_keyboard": [
+                            [{"text": "0.003 ETH", "callback_data": f"buy_{tx.get('to', '')}_0.003"},
+                             {"text": "0.005 ETH", "callback_data": f"buy_{tx.get('to', '')}_0.005"}],
+                            [{"text": "0.007 ETH", "callback_data": f"buy_{tx.get('to', '')}_0.007"},
+                             {"text": "0.01 ETH", "callback_data": f"buy_{tx.get('to', '')}_0.01"}],
+                        ]
+                    }
+                    tg_send(msg, reply_markup=buttons)
+                    if not dry_run:
+                        attempt_buy(w3, tx.get('to', ''), 3000, 0.001, cfg)
                 mempool = MempoolMonitor(
                     ws_rpc_url=cfg.get("RPC_URL", "wss://base-mainnet.public.blastapi.io").replace("https://", "wss://"),
-                    on_b20_detected=lambda tx, txh, st: print(f"[MEMPOOL] B20 early: {txh}"),
-                    on_pool_detected=lambda tx, txh, st: print(f"[MEMPOOL] Pool early: {txh}")
+                    on_b20_detected=on_b20_mem,
+                    on_pool_detected=lambda tx, txh, st: None
                 )
                 # Run in background thread
-                import threading
                 mempool_thread = threading.Thread(target=lambda: asyncio.run(mempool.start()), daemon=True)
                 mempool_thread.start()
                 print("Mempool monitoring started in background for early detection")
