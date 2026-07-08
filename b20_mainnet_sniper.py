@@ -261,6 +261,34 @@ def tg_send(message: str):
     except Exception as e:
         print(f"[TG] notify failed: {e}")
 
+def check_tg_commands(cfg: dict):
+    """Basic TG command polling for control (upgrade for live ops)."""
+    token = cfg.get("TG_BOT_TOKEN", "")
+    user_id = cfg.get("TG_USER_ID", "")
+    if not token or not user_id:
+        return
+    try:
+        import requests
+        # Simple getUpdates (in real, use offset to avoid duplicates)
+        url = f"https://api.telegram.org/bot{token}/getUpdates?limit=1&timeout=5"
+        resp = requests.get(url, timeout=10).json()
+        if resp.get("ok") and resp.get("result"):
+            for update in resp["result"]:
+                msg = update.get("message", {}).get("text", "").strip().lower()
+                if msg == "/status":
+                    tg_send("Bot status: LIVE monitoring active. Check logs for pools.")
+                elif msg == "/pause":
+                    # Simple pause by touch kill
+                    open(cfg.get("KILL_SWITCH_FILE", "/tmp/kill"), 'a').close()
+                    tg_send("Paused via TG command.")
+                elif msg == "/resume":
+                    kf = cfg.get("KILL_SWITCH_FILE", "/tmp/kill")
+                    if os.path.exists(kf):
+                        os.remove(kf)
+                    tg_send("Resumed.")
+    except Exception as e:
+        pass  # Silent to not spam logs
+
 def is_kill_switch_active(kill_file: str) -> bool:
     return os.path.exists(kill_file)
 
@@ -811,6 +839,10 @@ def monitor_new_pools_and_snipe(w3: Web3, buy_amount_eth: float = 0.05, cfg: dic
                 last_block = current_block
 
             time.sleep(5)  # Increased sleep to reduce rate limits on public RPCs
+
+            # Check for TG commands every loop
+            if 'check_tg_commands' in dir():
+                check_tg_commands(cfg)
 
         except KeyboardInterrupt:
             print("Monitor stopped by user.")
