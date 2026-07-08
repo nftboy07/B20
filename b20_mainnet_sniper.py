@@ -210,11 +210,10 @@ def load_config() -> Dict[str, Any]:
     }
     if not cfg["PRIVATE_KEY"]:
         print("WARNING: PRIVATE_KEY not set - transactions will fail. Use for monitoring only.")
-    # Leak-proof runtime guard
-    if not dry_run and ("YOUR" in cfg.get("PRIVATE_KEY", "") or len(cfg.get("PRIVATE_KEY", "")) < 10):
-        print("ERROR: Looks like a placeholder PRIVATE_KEY. Refusing to run in LIVE mode.")
-        print("Replace in .env with real key, then restart.")
-        sys.exit(1)
+    # Leak-proof runtime guard - check for placeholder keys
+    key = cfg.get("PRIVATE_KEY", "")
+    if key and ("YOUR" in key or len(key) < 10 or key.startswith("0x0000")):
+        print("WARNING: PRIVATE_KEY looks like a placeholder or dummy. Real transactions will fail.")
     return cfg
 
 def mask_sensitive(value: str, show_last: int = 4) -> str:
@@ -759,14 +758,14 @@ def monitor_new_pools_and_snipe(w3: Web3, buy_amount_eth: float = 0.05, cfg: dic
 
                 last_block = current_block
 
-            time.sleep(3)
+            time.sleep(5)  # Increased sleep to reduce rate limits on public RPCs
 
         except KeyboardInterrupt:
             print("Monitor stopped by user.")
             break
         except Exception as e:
             print(f"Monitor error: {e}")
-            time.sleep(5)
+            time.sleep(10)  # Backoff on errors (e.g. 429 rate limit)
 
 # =============================================================================
 # MAIN
@@ -793,6 +792,15 @@ def main():
     cfg = load_config()
     init_db()
     w3 = get_w3(cfg["RPC_URL"])
+
+    # Live mode guard
+    if not dry_run:
+        key = cfg.get("PRIVATE_KEY", "")
+        if not key or "YOUR" in key or len(key) < 10:
+            print("ERROR: Cannot run in LIVE mode with invalid/placeholder PRIVATE_KEY.")
+            print("Update .env with real key and restart.")
+            sys.exit(1)
+        print("LIVE MODE: Real funds at risk. Ensure wallet is funded with small test amount.")
 
     # Enforce Mainnet
     mainnet_sanity_check(w3)
