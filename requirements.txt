@@ -3,3 +3,5 @@ python-dotenv>=1.0.0
 eth-utils
 eth-abi
 requests>=2.31.0
+websockets>=11.0
+asyncio  # stdlib but note

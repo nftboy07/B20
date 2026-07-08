@@ -62,6 +62,7 @@ import sqlite3
 import argparse
 import random
 import threading
+import asyncio
 from datetime import datetime, timezone
 from typing import Optional, Tuple, Dict, Any
 
@@ -70,6 +71,14 @@ from web3 import Web3
 from web3.exceptions import TransactionNotFound
 from eth_utils import keccak, to_checksum_address
 from eth_abi import encode
+
+try:
+    from mempool_monitor import MempoolMonitor
+    from early_detection import EarlyDetectionEngine
+    MEMPOOL_AVAILABLE = True
+except ImportError:
+    MEMPOOL_AVAILABLE = False
+    print("Mempool modules not available (optional)")
 
 current_w3 = None
 
@@ -1130,6 +1139,22 @@ def main():
 
     if args.monitor or (not args.create_b20):
         print("\n--- STARTING POOL MONITOR + SNIPER ---")
+        # Start mempool monitoring in background for early signals if available
+        if MEMPOOL_AVAILABLE and not dry_run:
+            try:
+                mempool = MempoolMonitor(
+                    ws_rpc_url=cfg.get("RPC_URL", "wss://base-mainnet.public.blastapi.io").replace("https://", "wss://"),
+                    on_b20_detected=lambda tx, txh, st: print(f"[MEMPOOL] B20 early: {txh}"),
+                    on_pool_detected=lambda tx, txh, st: print(f"[MEMPOOL] Pool early: {txh}")
+                )
+                # Run in background thread
+                import threading
+                mempool_thread = threading.Thread(target=lambda: asyncio.run(mempool.start()), daemon=True)
+                mempool_thread.start()
+                print("Mempool monitoring started in background for early detection")
+            except Exception as me:
+                print(f"Mempool start failed (optional): {me}")
+
         monitor_new_pools_and_snipe(w3, buy_amount_eth=min(args.buy_amount, cfg["MAX_TRADE_ETH"]), cfg=cfg, dry_run=dry_run)
 
 if __name__ == "__main__":
