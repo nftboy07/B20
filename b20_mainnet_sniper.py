@@ -60,6 +60,7 @@ import time
 import json
 import sqlite3
 import argparse
+import random
 from datetime import datetime, timezone
 from typing import Optional, Tuple, Dict, Any
 
@@ -74,6 +75,27 @@ from eth_abi import encode
 # =============================================================================
 CHAIN_ID = 8453
 RPC_DEFAULT = "https://mainnet.base.org"
+
+# Extensive list of public Base Mainnet RPCs (HTTP + WS) for failover and reliability.
+# The bot will rotate through these to avoid rate limits (429s) during high-traffic meme launches.
+# Add your own paid ones in .env for best performance.
+DEFAULT_BASE_RPCS = [
+    "https://mainnet.base.org",
+    "https://base-mainnet.public.blastapi.io",
+    "https://base.meowrpc.com",
+    "https://base-pokt.nodies.app",
+    "https://rpc.ankr.com/base",
+    "https://base.drpc.org",
+    "https://1rpc.io/base",
+    "https://base.blockpi.network/v1/rpc/public",
+    "https://base.api.onfinality.io/public",
+    "https://gateway.tenderly.co/public/base",
+    "https://base.llamarpc.com",
+    "https://base.rpc.subquery.network/public",
+    "https://base-rpc.publicnode.com",
+    "wss://base-mainnet.public.blastapi.io",
+    "wss://base.meowrpc.com",
+]
 
 ACTIVATION_REGISTRY = to_checksum_address("0x8453000000000000000000000000000000000001")
 POLICY_REGISTRY     = to_checksum_address("0x8453000000000000000000000000000000000002")
@@ -207,7 +229,7 @@ def load_config() -> Dict[str, Any]:
         "MIN_LIQUIDITY_ETH": float(os.getenv("MIN_LIQUIDITY_ETH", "5.0")),
         "SLIPPAGE_BPS": int(os.getenv("SLIPPAGE_BPS", "2000")),
         "KILL_SWITCH_FILE": os.getenv("KILL_SWITCH_FILE", "/home/ubuntu/b20-bot/KILL_SWITCH"),
-        "BACKUP_RPCS": [r.strip() for r in os.getenv("BACKUP_RPCS", "").split(",") if r.strip()],
+        "BACKUP_RPCS": list(set(DEFAULT_BASE_RPCS + [r.strip() for r in os.getenv("BACKUP_RPCS", "").split(",") if r.strip()])),
         "TG_BOT_TOKEN": os.getenv("TG_BOT_TOKEN", ""),
         "TG_USER_ID": os.getenv("TG_USER_ID", ""),
     }
@@ -241,6 +263,28 @@ def get_w3(rpc_url: str) -> Web3:
     else:
         w3 = Web3(Web3.HTTPProvider(rpc_url))
     return w3
+
+def get_working_w3(rpc_list: list = None, max_attempts: int = 5) -> Web3:
+    """Try multiple RPCs until one works. Rotates list for load balancing.
+    This is key for surviving rate limits during meme launches.
+    """
+    if not rpc_list:
+        rpc_list = DEFAULT_BASE_RPCS
+    rpc_list = list(rpc_list)  # copy
+    random.shuffle(rpc_list)  # randomize to distribute load
+    for _ in range(max_attempts):
+        for rpc in rpc_list:
+            try:
+                w3 = get_w3(rpc)
+                # Quick health check
+                if w3.eth.chain_id == CHAIN_ID:
+                    print(f"Using RPC: {rpc[:50]}...")
+                    return w3
+            except Exception as e:
+                print(f"RPC {rpc[:30]}... failed: {str(e)[:50]}, trying next...")
+                continue
+        time.sleep(1)  # brief pause before retry
+    raise Exception("No working RPC found after attempts. Check your internet or add more RPCs in .env")
 
 # =============================================================================
 # TELEGRAM NOTIFICATIONS (optional)
@@ -963,7 +1007,8 @@ def main():
 
     cfg = load_config()
     init_db()
-    w3 = get_w3(cfg["RPC_URL"])
+    rpc_list = cfg.get("BACKUP_RPCS", []) or DEFAULT_BASE_RPCS
+    w3 = get_working_w3(rpc_list)
 
     # Live mode guard
     if not dry_run:
