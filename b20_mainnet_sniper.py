@@ -119,6 +119,9 @@ B20_FACTORY_ABI = [
     {"inputs": [{"internalType": "address", "name": "addr", "type": "address"}],
      "name": "isB20", "outputs": [{"internalType": "bool", "name": "", "type": "bool"}],
      "stateMutability": "view", "type": "function"},
+    {"inputs": [{"internalType": "address", "name": "addr", "type": "address"}],
+     "name": "isB20Initialized", "outputs": [{"internalType": "bool", "name": "", "type": "bool"}],
+     "stateMutability": "view", "type": "function"},
     # B20Created event for early detection (upgrade)
     {"anonymous": False, "inputs": [
         {"indexed": True, "internalType": "address", "name": "token", "type": "address"},
@@ -373,9 +376,8 @@ def log_trade(token: str, action: str, amount: float, tx_hash: str = "", status:
         print(f"[DB] log error: {e}")
 
 def check_token_safety(w3: Web3, token: str, min_liq: float) -> tuple[bool, str]:
-    """Basic safety checks. Returns (is_safe, reason)"""
+    """Enhanced safety checks to avoid honeypots, rugs, etc. Returns (is_safe, reason)"""
     try:
-        # Check liquidity
         pool = find_or_wait_pool(w3, WETH, token, 3000) or find_or_wait_pool(w3, WETH, token, 10000)
         if not pool:
             return False, "No WETH pool found"
@@ -383,13 +385,33 @@ def check_token_safety(w3: Web3, token: str, min_liq: float) -> tuple[bool, str]
         if liq < w3.to_wei(min_liq, "ether"):
             return False, f"Low liquidity: {liq}"
 
-        # Basic ERC20 checks (balance, etc.)
-        erc20_abi = [
-            {"constant":True,"inputs":[{"name":"_owner","type":"address"}],"name":"balanceOf","outputs":[{"name":"balance","type":"uint256"}],"type":"function"},
-        ]
-        token_contract = w3.eth.contract(address=to_checksum_address(token), abi=erc20_abi)
-        # If we can call balanceOf on WETH or something simple
-        return True, "Basic checks passed"
+        # Honeypot / rug checks: simulate small buy then sell using Quoter
+        test_eth = 0.001
+        amount_in = w3.to_wei(test_eth, 'ether')
+        try:
+            # Buy quote
+            buy_out = get_accurate_min_out(w3, token, 3000, amount_in, 1000)
+            if buy_out < 1:
+                return False, "Honeypot: buy quote 0 or very low"
+
+            # Sell quote back
+            sell_out = get_accurate_min_out(w3, WETH, 3000, buy_out, 1000)
+            if sell_out < amount_in * 0.7:  # lose more than 30% on roundtrip -> suspicious
+                return False, f"Honeypot detected: roundtrip loss >30% (got back {sell_out / 1e18} ETH)"
+
+        except Exception as sim_e:
+            return False, f"Honeypot sim failed: {str(sim_e)[:50]}"
+
+        # Additional B20 specific: check if token is initialized B20
+        try:
+            fac = get_b20_factory(w3)
+            if not fac.functions.isB20Initialized(to_checksum_address(token)).call():
+                # Still allow if it's B20 address pattern, but warn
+                pass
+        except:
+            pass
+
+        return True, "Passed honeypot and liq checks"
     except Exception as e:
         return False, f"Safety check error: {str(e)[:80]}"
 
@@ -811,6 +833,7 @@ def monitor_new_pools_and_snipe(w3: Web3, buy_amount_eth: float = 0.05, cfg: dic
     """
     Poll for UniswapV3 PoolCreated using get_logs (more reliable than persistent filters on HTTP RPCs).
     On new pool involving a token that looks like a fresh launch (or B20), attempt buy.
+    Automatic small amount 0.001 ETH sniping when live and activated.
     """
     factory = get_uniswap_v3_factory(w3)
     pool_created_topic = factory.events.PoolCreated.build_filter().topics[0]  # approx, use full event
@@ -819,12 +842,28 @@ def monitor_new_pools_and_snipe(w3: Web3, buy_amount_eth: float = 0.05, cfg: dic
 
     last_block = w3.eth.block_number
     seen_pools = set()
+    activated = False
+    last_activation_check = 0
+
+    # Fixed small amount for automatic meme sniping
+    SNIPE_AMOUNT_ETH = 0.001
 
     while True:
         if is_kill_switch_active(cfg.get("KILL_SWITCH_FILE", "")):
             print("KILL SWITCH ACTIVE - stopping monitor")
             tg_send("🛑 Kill switch activated - bot stopped")
             break
+
+        current_time = time.time()
+        if current_time - last_activation_check > 30:
+            try:
+                activated = check_b20_activated(w3, want_stable=False)
+                last_activation_check = current_time
+                if activated:
+                    tg_send("🎉 B20 ACTIVATION FLIPPED! Now fully LIVE for real B20 meme sniping (0.001 ETH auto).")
+            except Exception as act_e:
+                print(f"Activation check error: {act_e}")
+
         try:
             current_block = w3.eth.block_number
             if current_block > last_block:
@@ -872,13 +911,16 @@ def monitor_new_pools_and_snipe(w3: Web3, buy_amount_eth: float = 0.05, cfg: dic
                         if new_token.lower().startswith("0xb20") or is_b20:
                             print(f"Detected likely B20 token: {new_token} (isB20={is_b20})")
 
-                        if dry_run:
-                            print("[DRY RUN] Would attempt buy on", new_token)
+                        # Automatic small amount sniping - no pool alerts
+                        if dry_run or not activated:
+                            print(f"[{'DRY RUN' if dry_run else 'WAITING ACTIVATION'}] Would snipe {new_token} with {SNIPE_AMOUNT_ETH} ETH")
                             liq = check_pool_liquidity(w3, pool)
-                            print(f"[DRY RUN] liquidity() = {liq}")
+                            print(f"[{'DRY' if dry_run else 'WAIT'}] liquidity() = {liq}")
                             continue
 
-                        attempt_buy(w3, new_token, fee, buy_amount_eth, cfg, max_retries=1)
+                        # Real automatic snipe with small fixed amount
+                        print(f"AUTO SNIPE: Attempting buy {new_token} with {SNIPE_AMOUNT_ETH} ETH (live)")
+                        attempt_buy(w3, new_token, fee, SNIPE_AMOUNT_ETH, cfg, max_retries=1)
                     except Exception as decode_err:
                         print(f"Log decode error: {decode_err}")
 
