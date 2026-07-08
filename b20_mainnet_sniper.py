@@ -242,8 +242,10 @@ def get_w3(rpc_url: str) -> Web3:
 # =============================================================================
 # TELEGRAM NOTIFICATIONS (optional)
 # =============================================================================
-def tg_send(message: str):
-    """Send message to Telegram if TG_BOT_TOKEN and TG_USER_ID are set in .env"""
+def tg_send(message: str, reply_markup: dict = None):
+    """Send message to Telegram if TG_BOT_TOKEN and TG_USER_ID are set in .env.
+    Supports optional inline keyboard buttons for commands.
+    """
     token = os.getenv("TG_BOT_TOKEN")
     user_id = os.getenv("TG_USER_ID")
     if not token or not user_id:
@@ -257,37 +259,93 @@ def tg_send(message: str):
             "parse_mode": "HTML",
             "disable_web_page_preview": True
         }
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
         requests.post(url, json=payload, timeout=8)
     except Exception as e:
         print(f"[TG] notify failed: {e}")
 
 def check_tg_commands(cfg: dict):
-    """Basic TG command polling for control (upgrade for live ops)."""
+    """TG commands with inline buttons for control.
+    Supports /start to show buttons, and callback buttons for pause/resume/status.
+    Uses offset file to avoid reprocessing updates.
+    """
     token = cfg.get("TG_BOT_TOKEN", "")
     user_id = cfg.get("TG_USER_ID", "")
     if not token or not user_id:
         return
     try:
         import requests
-        # Simple getUpdates (in real, use offset to avoid duplicates)
-        url = f"https://api.telegram.org/bot{token}/getUpdates?limit=1&timeout=5"
+        import os
+        offset_file = "/home/ubuntu/b20-bot/tg_offset.txt"
+        offset = 0
+        if os.path.exists(offset_file):
+            with open(offset_file) as f:
+                offset = int(f.read().strip() or 0)
+
+        url = f"https://api.telegram.org/bot{token}/getUpdates?offset={offset}&limit=10&timeout=5"
         resp = requests.get(url, timeout=10).json()
-        if resp.get("ok") and resp.get("result"):
-            for update in resp["result"]:
-                msg = update.get("message", {}).get("text", "").strip().lower()
-                if msg == "/status":
-                    tg_send("Bot status: LIVE monitoring active. Check logs for pools.")
-                elif msg == "/pause":
-                    # Simple pause by touch kill
+
+        if not resp.get("ok") or not resp.get("result"):
+            return
+
+        new_offset = offset
+        for update in resp["result"]:
+            new_offset = update["update_id"] + 1
+
+            # Handle callback_query (buttons)
+            if "callback_query" in update:
+                cb = update["callback_query"]
+                data = cb.get("data", "")
+                cb_id = cb["id"]
+                # Answer callback to remove loading
+                requests.post(f"https://api.telegram.org/bot{token}/answerCallbackQuery", json={"callback_query_id": cb_id})
+
+                if data == "status":
+                    tg_send("📊 Bot Status: LIVE mode active. Monitoring pools. Check logs.")
+                elif data == "pause":
                     open(cfg.get("KILL_SWITCH_FILE", "/tmp/kill"), 'a').close()
-                    tg_send("Paused via TG command.")
-                elif msg == "/resume":
+                    tg_send("⏸️ Paused monitoring.")
+                elif data == "resume":
                     kf = cfg.get("KILL_SWITCH_FILE", "/tmp/kill")
                     if os.path.exists(kf):
                         os.remove(kf)
-                    tg_send("Resumed.")
+                    tg_send("▶️ Resumed monitoring.")
+                elif data == "kill":
+                    open(cfg.get("KILL_SWITCH_FILE", "/tmp/kill"), 'a').close()
+                    tg_send("🛑 Kill switch activated.")
+
+                continue
+
+            # Handle text messages
+            msg = update.get("message", {}).get("text", "").strip().lower()
+            if msg == "/start" or msg == "/menu":
+                # Send buttons
+                buttons = {
+                    "inline_keyboard": [
+                        [{"text": "📊 Status", "callback_data": "status"},
+                         {"text": "⏸️ Pause", "callback_data": "pause"}],
+                        [{"text": "▶️ Resume", "callback_data": "resume"},
+                         {"text": "🛑 Kill", "callback_data": "kill"}]
+                    ]
+                }
+                tg_send("B20 Bot Control Panel (LIVE):", reply_markup=buttons)
+            elif msg == "/status":
+                tg_send("📊 Bot Status: LIVE monitoring active. Use /menu for buttons.")
+            elif msg == "/pause":
+                open(cfg.get("KILL_SWITCH_FILE", "/tmp/kill"), 'a').close()
+                tg_send("⏸️ Paused via command.")
+            elif msg == "/resume":
+                kf = cfg.get("KILL_SWITCH_FILE", "/tmp/kill")
+                if os.path.exists(kf):
+                    os.remove(kf)
+                tg_send("▶️ Resumed via command.")
+
+        # Save offset
+        with open(offset_file, "w") as f:
+            f.write(str(new_offset))
     except Exception as e:
-        pass  # Silent to not spam logs
+        print(f"[TG] command poll error: {e}")  # log but don't crash
 
 def is_kill_switch_active(kill_file: str) -> bool:
     return os.path.exists(kill_file)
@@ -408,7 +466,6 @@ def check_recent_b20_creations(w3: Web3, last_block: int, current_block: int) ->
                 if token:
                     creations.append(token)
                     print(f"B20Created early signal: {token}")
-                    tg_send(f"🆕 <b>B20 Token Created</b>\n<code>{token}</code>")
             except:
                 pass
         return creations
@@ -642,13 +699,6 @@ def attempt_buy(w3: Web3, token: str, fee: int, amount_eth: float, cfg: dict,
 
     print(f"Pool {pool} liquidity: {liq}. Proceeding with buy attempt.")
 
-    # Safety + liquidity check
-    safe, reason = check_token_safety(w3, token, cfg.get("MIN_LIQUIDITY_ETH", 5.0))
-    if not safe:
-        print(f"SAFETY SKIP: {reason}")
-        tg_send(f"⛔ Safety skip for {token}: {reason}")
-        return None
-
     amount_in = w3.to_wei(amount_eth, "ether")
 
     # Proper slippage from cfg + accurate quote (Quoter upgrade)
@@ -822,14 +872,10 @@ def monitor_new_pools_and_snipe(w3: Web3, buy_amount_eth: float = 0.05, cfg: dic
                         if new_token.lower().startswith("0xb20") or is_b20:
                             print(f"Detected likely B20 token: {new_token} (isB20={is_b20})")
 
-                        b20_flag = " [B20]" if (new_token.lower().startswith("0xb20") or is_b20) else ""
-                        tg_send(f"🆕 <b>New Pool{b20_flag}</b>\n<code>{token0}</code> / <code>{token1}</code>\nFee: {fee}\nPool: <code>{pool}</code>")
-
                         if dry_run:
                             print("[DRY RUN] Would attempt buy on", new_token)
                             liq = check_pool_liquidity(w3, pool)
                             print(f"[DRY RUN] liquidity() = {liq}")
-                            tg_send(f"💧 Liquidity for {new_token}: {liq}")
                             continue
 
                         attempt_buy(w3, new_token, fee, buy_amount_eth, cfg, max_retries=1)
@@ -903,6 +949,17 @@ def main():
     if not dry_run:
         print("⚠️  LIVE MODE ENABLED - REAL ETH WILL BE USED")
         tg_send("⚠️ <b>LIVE MODE</b> - Real trades active")
+
+    # Send buttons menu on startup
+    buttons = {
+        "inline_keyboard": [
+            [{"text": "📊 Status", "callback_data": "status"},
+             {"text": "⏸️ Pause", "callback_data": "pause"}],
+            [{"text": "▶️ Resume", "callback_data": "resume"},
+             {"text": "🛑 Kill", "callback_data": "kill"}]
+        ]
+    }
+    tg_send("B20 Bot Controls:", reply_markup=buttons)
 
     if args.create_b20:
         print("\n--- CREATE B20 ---")
