@@ -574,17 +574,18 @@ def get_accurate_min_out(w3: Web3, token_out: str, fee: int, amount_in_wei: int,
     """Use QuoterV2 for realistic amountOut, then apply slippage. Major upgrade for live trading."""
     try:
         quoter = w3.eth.contract(address=UNISWAP_QUOTER_V2, abi=UNISWAP_QUOTER_V2_ABI)
-        # quoteExactInputSingle params struct (simplified for V3)
-        params = encode(
-            ["address", "address", "uint24", "uint256", "uint160"],
-            [WETH, to_checksum_address(token_out), fee, amount_in_wei, 0]
+        # Proper struct for QuoterV2 quoteExactInputSingle
+        params = (
+            WETH,
+            to_checksum_address(token_out),
+            fee,
+            amount_in_wei,
+            0  # sqrtPriceLimitX96 = 0 for no limit
         )
-        # Note: actual QuoterV2 uses a struct; this is approximate. For production use full struct.
-        # Fallback to rough if fails
         quoted = quoter.functions.quoteExactInputSingle(params).call()
         amount_out = quoted[0] if isinstance(quoted, (list, tuple)) else quoted
         min_out = int(amount_out * (10000 - slippage_bps) / 10000)
-        return max(min_out, 0)
+        return max(min_out, 1)  # at least 1 to avoid zero
     except Exception as e:
         print(f"[Quoter] Failed, falling back to rough estimate: {e}")
         # Rough fallback: assume 1:1 minus slippage
