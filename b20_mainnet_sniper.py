@@ -93,8 +93,6 @@ DEFAULT_BASE_RPCS = [
     "https://base.llamarpc.com",
     "https://base.rpc.subquery.network/public",
     "https://base-rpc.publicnode.com",
-    "wss://base-mainnet.public.blastapi.io",
-    "wss://base.meowrpc.com",
 ]
 
 ACTIVATION_REGISTRY = to_checksum_address("0x8453000000000000000000000000000000000001")
@@ -258,10 +256,11 @@ def get_safe_config(cfg: dict) -> dict:
     return safe
 
 def get_w3(rpc_url: str) -> Web3:
+    # Use HTTPProvider for reliability (WS can have compatibility issues across providers)
+    # User can still put wss in .env but we force HTTP here for stability
     if rpc_url.startswith("wss://"):
-        w3 = Web3(Web3.WebsocketProvider(rpc_url))
-    else:
-        w3 = Web3(Web3.HTTPProvider(rpc_url))
+        rpc_url = rpc_url.replace("wss://", "https://")  # fallback to http equiv if possible, but better use http list
+    w3 = Web3(Web3.HTTPProvider(rpc_url))
     return w3
 
 def get_working_w3(rpc_list: list = None, max_attempts: int = 5) -> Web3:
