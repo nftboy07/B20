@@ -262,11 +262,13 @@ def get_safe_config(cfg: dict) -> dict:
     return safe
 
 def get_w3(rpc_url: str) -> Web3:
-    # Use HTTPProvider for reliability (WS can have compatibility issues across providers)
-    # User can still put wss in .env but we force HTTP here for stability
     if rpc_url.startswith("wss://"):
-        rpc_url = rpc_url.replace("wss://", "https://")  # fallback to http equiv if possible, but better use http list
-    w3 = Web3(Web3.HTTPProvider(rpc_url))
+        try:
+            w3 = Web3(Web3.WebsocketProvider(rpc_url))
+        except:
+            w3 = Web3(Web3.WebSocketProvider(rpc_url))
+    else:
+        w3 = Web3(Web3.HTTPProvider(rpc_url))
     return w3
 
 def get_working_w3(rpc_list: list = None, max_attempts: int = 5) -> Web3:
