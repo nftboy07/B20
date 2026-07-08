@@ -177,8 +177,8 @@ def load_config() -> Dict[str, str]:
         "WALLET_ADDRESS": os.getenv("WALLET_ADDRESS", ""),
     }
     if not cfg["PRIVATE_KEY"]:
-        print("ERROR: PRIVATE_KEY not set in environment or .env")
-        sys.exit(1)
+        # Allow running in pure monitor/dry-run without key (for setup and testing)
+        print("WARNING: PRIVATE_KEY not set - transactions will fail. Use for monitoring only.")
     return cfg
 
 def get_w3(rpc_url: str) -> Web3:
