@@ -1032,7 +1032,8 @@ def monitor_new_pools_and_snipe(w3: Web3, buy_amount_eth: float = 0.05, cfg: dic
             print(f"Monitor error: {e}")
             # Refresh w3 from the many RPCs on error (failover)
             try:
-                w3 = get_working_w3()
+                rpc_list = cfg.get("BACKUP_RPCS", []) or DEFAULT_BASE_RPCS
+                w3 = get_working_w3(rpc_list)
                 global current_w3
                 current_w3 = w3
                 print("Switched to new RPC due to error")
