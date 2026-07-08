@@ -93,6 +93,13 @@ DEFAULT_BASE_RPCS = [
     "https://base.llamarpc.com",
     "https://base.rpc.subquery.network/public",
     "https://base-rpc.publicnode.com",
+    "https://base-mainnet-rpc.allthatnode.com",
+    "https://base.publicnode.com",
+    "https://base-mainnet.g.alchemy.com/v2",  # user should add key
+    "https://base-mainnet.infura.io/v3",  # user should add key
+    "https://base.nodereal.io/v1",  # may need key
+    "https://rpc.arbiscan.io",  # fallback? no, base specific
+    "https://base-rpc.com",  # if exists
 ]
 
 ACTIVATION_REGISTRY = to_checksum_address("0x8453000000000000000000000000000000000001")
@@ -1023,6 +1030,12 @@ def monitor_new_pools_and_snipe(w3: Web3, buy_amount_eth: float = 0.05, cfg: dic
             break
         except Exception as e:
             print(f"Monitor error: {e}")
+            # Refresh w3 from the many RPCs on error (failover)
+            try:
+                w3 = get_working_w3()
+                print("Switched to new RPC due to error")
+            except:
+                pass
             time.sleep(10)  # Backoff on errors (e.g. 429 rate limit)
 
 # =============================================================================
