@@ -990,10 +990,10 @@ def monitor_new_pools_and_snipe(w3: Web3, buy_amount_eth: float = 0.05, cfg: dic
 
                             buttons = {
                                 "inline_keyboard": [
-                                    [{"text": "Buy 0.003 ETH", "callback_data": f"buy_{new_token}_0.003"}],
-                                    [{"text": "Buy 0.005 ETH", "callback_data": f"buy_{new_token}_0.005"}],
-                                    [{"text": "Buy 0.007 ETH", "callback_data": f"buy_{new_token}_0.007"}],
-                                    [{"text": "Buy 0.01 ETH", "callback_data": f"buy_{new_token}_0.01"}],
+                                    [{"text": "0.003 ETH", "callback_data": f"buy_{new_token}_0.003"},
+                                     {"text": "0.005 ETH", "callback_data": f"buy_{new_token}_0.005"}],
+                                    [{"text": "0.007 ETH", "callback_data": f"buy_{new_token}_0.007"},
+                                     {"text": "0.01 ETH", "callback_data": f"buy_{new_token}_0.01"}],
                                 ]
                             }
                             tg_send(msg, reply_markup=buttons)
