@@ -657,6 +657,7 @@ def attempt_buy(w3: Web3, token: str, fee: int, amount_eth: float, cfg: dict,
                 print("BUY SUCCESS:", tx_hash.hex())
                 log_trade(token, "buy", amount_eth, tx_hash.hex(), "success")
                 tg_send(f"✅ <b>BUY SUCCESS</b> for {token}\nTx: <code>{tx_hash.hex()}</code>")
+                # Basic auto-sell hook for future (implement sell on profit)
                 return tx_hash.hex()
             else:
                 print("Buy tx reverted.")
@@ -673,6 +674,56 @@ def attempt_buy(w3: Web3, token: str, fee: int, amount_eth: float, cfg: dict,
                 print("Liquidity disappeared. Aborting retries.")
                 break
 
+    return None
+
+def attempt_sell(w3: Web3, token: str, fee: int, amount_token: int, cfg: dict, max_retries: int = 1) -> Optional[str]:
+    """Basic sell logic for take profit or emergency. Uses exactInputSingle for token to ETH."""
+    if not amount_token or amount_token <= 0:
+        return None
+    account = w3.eth.account.from_key(os.getenv("PRIVATE_KEY"))
+    sender = account.address
+    pool = find_or_wait_pool(w3, token, WETH, fee) or find_or_wait_pool(w3, WETH, token, fee)
+    if not pool:
+        print("No pool for sell")
+        return None
+    # Use slippage from cfg
+    slippage_bps = cfg.get("SLIPPAGE_BPS", 2000)
+    min_out = int(amount_token * (10000 - slippage_bps) / 10000)  # rough for now
+    router = get_router(w3)
+    deadline = int(time.time()) + 300
+    params = {
+        "tokenIn": to_checksum_address(token),
+        "tokenOut": WETH,
+        "fee": fee,
+        "recipient": sender,
+        "deadline": deadline,
+        "amountIn": amount_token,
+        "amountOutMinimum": min_out,
+        "sqrtPriceLimitX96": 0,
+    }
+    tx = router.functions.exactInputSingle(params).build_transaction({
+        "from": sender,
+        "chainId": CHAIN_ID,
+    })
+    max_fee = get_gas_price_with_premium(w3, 50)
+    tx["maxFeePerGas"] = max_fee
+    tx["maxPriorityFeePerGas"] = w3.to_wei(2, "gwei")
+    tx["nonce"] = w3.eth.get_transaction_count(sender)
+    gas = estimate_gas_with_buffer(w3, tx)
+    tx["gas"] = gas
+    print(f"Sell attempt: amount_token={amount_token}")
+    signed = account.sign_transaction(tx)
+    try:
+        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+        print("Sell tx sent:", tx_hash.hex())
+        tg_send(f"💸 Sell tx sent for <code>{token}</code>\nTx: <code>{tx_hash.hex()}</code>")
+        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=90)
+        if receipt.status == 1:
+            log_trade(token, "sell", amount_token, tx_hash.hex(), "success")
+            tg_send(f"✅ <b>SELL SUCCESS</b> for {token}")
+            return tx_hash.hex()
+    except Exception as e:
+        print(f"Sell error: {e}")
     return None
 
 # =============================================================================
