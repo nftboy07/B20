@@ -61,6 +61,7 @@ import json
 import sqlite3
 import argparse
 import random
+import threading
 from datetime import datetime, timezone
 from typing import Optional, Tuple, Dict, Any
 
@@ -69,6 +70,8 @@ from web3 import Web3
 from web3.exceptions import TransactionNotFound
 from eth_utils import keccak, to_checksum_address
 from eth_abi import encode
+
+current_w3 = None
 
 # =============================================================================
 # MAINNET-ONLY CONSTANTS (DO NOT CHANGE)
@@ -281,8 +284,7 @@ def get_working_w3(rpc_list: list = None, max_attempts: int = 5) -> Web3:
                 w3 = get_w3(rpc)
                 # Strong health check: chain + simple call
                 if w3.eth.chain_id == CHAIN_ID:
-                    # Test eth_call (some public RPCs restrict it)
-                    w3.eth.call({"to": ACTIVATION_REGISTRY, "data": "0x"})
+                    # Simple health: just chain_id is enough for most, avoid eth_call on precompiles if restricted
                     print(f"Using RPC: {rpc[:50]}...")
                     return w3
             except Exception as e:
@@ -321,97 +323,100 @@ def check_tg_commands(cfg: dict, w3=None):
     """TG commands with inline buttons for control.
     Supports /start to show buttons, and callback buttons for pause/resume/status + buy buttons.
     Uses offset file to avoid reprocessing updates.
+    Runs in own thread for fast response.
     """
     token = cfg.get("TG_BOT_TOKEN", "")
     user_id = cfg.get("TG_USER_ID", "")
     if not token or not user_id:
         return
-    try:
-        import requests
-        import os
-        offset_file = "/home/ubuntu/b20-bot/tg_offset.txt"
-        offset = 0
-        if os.path.exists(offset_file):
+    offset_file = "/home/ubuntu/b20-bot/tg_offset.txt"
+    offset = 0
+    if os.path.exists(offset_file):
+        try:
             with open(offset_file) as f:
                 offset = int(f.read().strip() or 0)
+        except:
+            offset = 0
+    while True:
+        try:
+            import requests
+            url = f"https://api.telegram.org/bot{token}/getUpdates?offset={offset}&limit=10&timeout=2"
+            resp = requests.get(url, timeout=10).json()
 
-        url = f"https://api.telegram.org/bot{token}/getUpdates?offset={offset}&limit=10&timeout=5"
-        resp = requests.get(url, timeout=10).json()
+            if not resp.get("ok") or not resp.get("result"):
+                time.sleep(1)
+                continue
 
-        if not resp.get("ok") or not resp.get("result"):
-            return
+            new_offset = offset
+            for update in resp["result"]:
+                new_offset = update["update_id"] + 1
 
-        new_offset = offset
-        for update in resp["result"]:
-            new_offset = update["update_id"] + 1
+                # Handle callback_query (buttons)
+                if "callback_query" in update:
+                    cb = update["callback_query"]
+                    data = cb.get("data", "")
+                    cb_id = cb["id"]
+                    requests.post(f"https://api.telegram.org/bot{token}/answerCallbackQuery", json={"callback_query_id": cb_id})
 
-            # Handle callback_query (buttons)
-            if "callback_query" in update:
-                cb = update["callback_query"]
-                data = cb.get("data", "")
-                cb_id = cb["id"]
-                # Answer callback to remove loading
-                requests.post(f"https://api.telegram.org/bot{token}/answerCallbackQuery", json={"callback_query_id": cb_id})
+                    if data == "status":
+                        tg_send("📊 Bot Status: LIVE mode active. Monitoring pools. Check logs.")
+                    elif data == "pause":
+                        open(cfg.get("KILL_SWITCH_FILE", "/tmp/kill"), 'a').close()
+                        tg_send("⏸️ Paused monitoring.")
+                    elif data == "resume":
+                        kf = cfg.get("KILL_SWITCH_FILE", "/tmp/kill")
+                        if os.path.exists(kf):
+                            os.remove(kf)
+                        tg_send("▶️ Resumed monitoring.")
+                    elif data == "kill":
+                        open(cfg.get("KILL_SWITCH_FILE", "/tmp/kill"), 'a').close()
+                        tg_send("🛑 Kill switch activated.")
+                    elif data.startswith("buy_"):
+                        try:
+                            _, tkn, amt_str = data.split("_", 2)
+                            amt = float(amt_str)
+                            use_w3 = w3 or current_w3
+                            if use_w3:
+                                tg_send(f"Executing buy {amt} ETH on {tkn}...")
+                                f = 3000
+                                p = find_or_wait_pool(use_w3, WETH, tkn, f) or find_or_wait_pool(use_w3, tkn, WETH, f)
+                                if not p:
+                                    f = 10000
+                                attempt_buy(use_w3, tkn, f, amt, cfg, max_retries=1)
+                        except Exception as be:
+                            tg_send(f"Buy button error: {be}")
 
-                if data == "status":
-                    tg_send("📊 Bot Status: LIVE mode active. Monitoring pools. Check logs.")
-                elif data == "pause":
+                    continue
+
+                # Handle text messages
+                msg = update.get("message", {}).get("text", "").strip().lower()
+                if msg == "/start" or msg == "/menu":
+                    buttons = {
+                        "inline_keyboard": [
+                            [{"text": "📊 Status", "callback_data": "status"},
+                             {"text": "⏸️ Pause", "callback_data": "pause"}],
+                            [{"text": "▶️ Resume", "callback_data": "resume"},
+                             {"text": "🛑 Kill", "callback_data": "kill"}]
+                        ]
+                    }
+                    tg_send("B20 Bot Control Panel (LIVE):", reply_markup=buttons)
+                elif msg == "/status":
+                    tg_send("📊 Bot Status: LIVE monitoring active. Use /menu for buttons.")
+                elif msg == "/pause":
                     open(cfg.get("KILL_SWITCH_FILE", "/tmp/kill"), 'a').close()
-                    tg_send("⏸️ Paused monitoring.")
-                elif data == "resume":
+                    tg_send("⏸️ Paused via command.")
+                elif msg == "/resume":
                     kf = cfg.get("KILL_SWITCH_FILE", "/tmp/kill")
                     if os.path.exists(kf):
                         os.remove(kf)
-                    tg_send("▶️ Resumed monitoring.")
-                elif data == "kill":
-                    open(cfg.get("KILL_SWITCH_FILE", "/tmp/kill"), 'a').close()
-                    tg_send("🛑 Kill switch activated.")
-                elif data.startswith("buy_"):
-                    try:
-                        _, tkn, amt_str = data.split("_", 2)
-                        amt = float(amt_str)
-                        if w3:
-                            tg_send(f"Executing buy {amt} ETH on {tkn}...")
-                            # Try common fees
-                            f = 3000
-                            p = find_or_wait_pool(w3, WETH, tkn, f) or find_or_wait_pool(w3, tkn, WETH, f)
-                            if not p:
-                                f = 10000
-                            attempt_buy(w3, tkn, f, amt, cfg, max_retries=1)
-                    except Exception as be:
-                        tg_send(f"Buy button error: {be}")
+                    tg_send("▶️ Resumed via command.")
 
-                continue
-
-            # Handle text messages
-            msg = update.get("message", {}).get("text", "").strip().lower()
-            if msg == "/start" or msg == "/menu":
-                # Send buttons
-                buttons = {
-                    "inline_keyboard": [
-                        [{"text": "📊 Status", "callback_data": "status"},
-                         {"text": "⏸️ Pause", "callback_data": "pause"}],
-                        [{"text": "▶️ Resume", "callback_data": "resume"},
-                         {"text": "🛑 Kill", "callback_data": "kill"}]
-                    ]
-                }
-                tg_send("B20 Bot Control Panel (LIVE):", reply_markup=buttons)
-            elif msg == "/status":
-                tg_send("📊 Bot Status: LIVE monitoring active. Use /menu for buttons.")
-            elif msg == "/pause":
-                open(cfg.get("KILL_SWITCH_FILE", "/tmp/kill"), 'a').close()
-                tg_send("⏸️ Paused via command.")
-            elif msg == "/resume":
-                kf = cfg.get("KILL_SWITCH_FILE", "/tmp/kill")
-                if os.path.exists(kf):
-                    os.remove(kf)
-                tg_send("▶️ Resumed via command.")
-
-        # Save offset
-        with open(offset_file, "w") as f:
-            f.write(str(new_offset))
-    except Exception as e:
-        print(f"[TG] command poll error: {e}")  # log but don't crash
+            with open(offset_file, "w") as f:
+                f.write(str(new_offset))
+            offset = new_offset
+        except Exception as e:
+            print(f"[TG] command poll error: {e}")
+            time.sleep(2)
 
 def is_kill_switch_active(kill_file: str) -> bool:
     return os.path.exists(kill_file)
@@ -1018,8 +1023,7 @@ def monitor_new_pools_and_snipe(w3: Web3, buy_amount_eth: float = 0.05, cfg: dic
 
             time.sleep(5)  # Increased sleep to reduce rate limits on public RPCs
 
-            # Check for TG commands every loop
-            check_tg_commands(cfg, w3)
+            # TG commands now in separate thread for speed (see below)
 
         except KeyboardInterrupt:
             print("Monitor stopped by user.")
@@ -1029,6 +1033,8 @@ def monitor_new_pools_and_snipe(w3: Web3, buy_amount_eth: float = 0.05, cfg: dic
             # Refresh w3 from the many RPCs on error (failover)
             try:
                 w3 = get_working_w3()
+                global current_w3
+                current_w3 = w3
                 print("Switched to new RPC due to error")
             except:
                 pass
@@ -1060,6 +1066,12 @@ def main():
     init_db()
     rpc_list = cfg.get("BACKUP_RPCS", []) or DEFAULT_BASE_RPCS
     w3 = get_working_w3(rpc_list)
+    global current_w3
+    current_w3 = w3
+
+    # Run TG polling in separate thread for faster response to commands/buttons
+    tg_thread = threading.Thread(target=check_tg_commands, args=(cfg, None), daemon=True)
+    tg_thread.start()
 
     # Live mode guard
     if not dry_run:
