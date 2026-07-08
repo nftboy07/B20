@@ -76,7 +76,7 @@ Use at your own risk. Gas is real. Slippages on launch pools are brutal.
    icacls $KEY /inheritance:r /grant:r "$env:USERNAME:(R)"
 
    # Copy the project
-   scp -i $KEY -r C:\Users\91907\B20-repo $VPS:/root/b20-bot   # or /home/ubuntu/b20-bot
+   scp -i $KEY -r C:\Users\91907\B20-repo $VPS:/home/ubuntu/b20-bot
 
    # SSH in
    ssh -i $KEY $VPS
@@ -84,7 +84,7 @@ Use at your own risk. Gas is real. Slippages on launch pools are brutal.
 
 2. On the VPS:
    ```bash
-   cd /root/b20-bot   # adjust path
+   cd /home/ubuntu/b20-bot   # adjust path
    sudo apt update && sudo apt install -y python3-venv python3-pip git
    python3 -m venv venv
    source venv/bin/activate
