@@ -95,11 +95,6 @@ DEFAULT_BASE_RPCS = [
     "https://base-rpc.publicnode.com",
     "https://base-mainnet-rpc.allthatnode.com",
     "https://base.publicnode.com",
-    "https://base-mainnet.g.alchemy.com/v2",  # user should add key
-    "https://base-mainnet.infura.io/v3",  # user should add key
-    "https://base.nodereal.io/v1",  # may need key
-    "https://rpc.arbiscan.io",  # fallback? no, base specific
-    "https://base-rpc.com",  # if exists
 ]
 
 ACTIVATION_REGISTRY = to_checksum_address("0x8453000000000000000000000000000000000001")
@@ -234,10 +229,11 @@ def load_config() -> Dict[str, Any]:
         "MIN_LIQUIDITY_ETH": float(os.getenv("MIN_LIQUIDITY_ETH", "5.0")),
         "SLIPPAGE_BPS": int(os.getenv("SLIPPAGE_BPS", "2000")),
         "KILL_SWITCH_FILE": os.getenv("KILL_SWITCH_FILE", "/home/ubuntu/b20-bot/KILL_SWITCH"),
-        "BACKUP_RPCS": list(set(DEFAULT_BASE_RPCS + [r.strip() for r in os.getenv("BACKUP_RPCS", "").split(",") if r.strip()])),
         "TG_BOT_TOKEN": os.getenv("TG_BOT_TOKEN", ""),
         "TG_USER_ID": os.getenv("TG_USER_ID", ""),
     }
+    user_rpcs = [r.strip() for r in os.getenv("BACKUP_RPCS", "").split(",") if r.strip()]
+    cfg["BACKUP_RPCS"] = user_rpcs + [r for r in DEFAULT_BASE_RPCS if r not in user_rpcs]  # user first, then defaults, no dups
     if not cfg["PRIVATE_KEY"]:
         print("WARNING: PRIVATE_KEY not set - transactions will fail. Use for monitoring only.")
     # Leak-proof runtime guard - check for placeholder keys
