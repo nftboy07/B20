@@ -188,6 +188,28 @@ def get_w3(rpc_url: str) -> Web3:
         w3 = Web3(Web3.HTTPProvider(rpc_url))
     return w3
 
+# =============================================================================
+# TELEGRAM NOTIFICATIONS (optional)
+# =============================================================================
+def tg_send(message: str):
+    """Send message to Telegram if TG_BOT_TOKEN and TG_USER_ID are set in .env"""
+    token = os.getenv("TG_BOT_TOKEN")
+    user_id = os.getenv("TG_USER_ID")
+    if not token or not user_id:
+        return
+    try:
+        import requests
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        payload = {
+            "chat_id": user_id,
+            "text": message,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True
+        }
+        requests.post(url, json=payload, timeout=8)
+    except Exception as e:
+        print(f"[TG] notify failed: {e}")
+
 def mainnet_sanity_check(w3: Web3) -> None:
     """Executable Mainnet-Only Check (adapted for precompiles).
 
@@ -477,14 +499,18 @@ def attempt_buy(w3: Web3, token: str, fee: int, amount_eth: float, slippage_bps:
         try:
             tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
             print("Buy tx sent:", tx_hash.hex())
+            tg_send(f"💰 Buy tx sent for <code>{token}</code>\nAmount: {amount_eth} ETH\nTx: <code>{tx_hash.hex()}</code>")
             receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=90)
             if receipt.status == 1:
                 print("BUY SUCCESS:", tx_hash.hex())
+                tg_send(f"✅ <b>BUY SUCCESS</b> for {token}\nTx: <code>{tx_hash.hex()}</code>")
                 return tx_hash.hex()
             else:
                 print("Buy tx reverted.")
+                tg_send(f"❌ Buy tx reverted for {token}")
         except Exception as e:
             print(f"Send error: {e}")
+            tg_send(f"❌ Buy error for {token}: {str(e)[:100]}")
 
         # Per spec: if failed, retry immediately with higher gas / lower slippage (we already loosen on retry)
         if attempt < max_retries:
@@ -553,6 +579,10 @@ def monitor_new_pools_and_snipe(w3: Web3, buy_amount_eth: float = 0.05, dry_run:
                         if new_token.lower().startswith("0xb20") or is_b20:
                             print(f"Detected likely B20 token: {new_token} (isB20={is_b20})")
 
+                        # Telegram notification for every new pool
+                        b20_flag = " [B20]" if (new_token.lower().startswith("0xb20") or is_b20) else ""
+                        tg_send(f"🆕 <b>New Pool{b20_flag}</b>\n{token0[:8]}... / {token1[:8]}...\nFee: {fee}\nPool: <code>{pool}</code>")
+
                         if dry_run:
                             print("[DRY RUN] Would attempt buy on", new_token)
                             liq = check_pool_liquidity(w3, pool)
@@ -606,6 +636,8 @@ def main():
     asset_ok = check_b20_activated(w3, want_stable=False)
     if not asset_ok:
         print("WARNING: B20 ASSET not yet activated on-chain. createB20 will revert with FeatureNotActivated.")
+
+    tg_send(f"🚀 <b>B20 Bot started</b>\nMode: {'DRY-RUN' if dry_run else 'LIVE'}\nB20 Activated: {asset_ok}\nChain: 8453")
 
     if args.create_b20:
         print("\n--- CREATE B20 ---")
