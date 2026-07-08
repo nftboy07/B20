@@ -267,6 +267,7 @@ def get_w3(rpc_url: str) -> Web3:
 def get_working_w3(rpc_list: list = None, max_attempts: int = 5) -> Web3:
     """Try multiple RPCs until one works. Rotates list for load balancing.
     This is key for surviving rate limits during meme launches.
+    Tests chainId + eth_call for full compatibility.
     """
     if not rpc_list:
         rpc_list = DEFAULT_BASE_RPCS
@@ -276,12 +277,14 @@ def get_working_w3(rpc_list: list = None, max_attempts: int = 5) -> Web3:
         for rpc in rpc_list:
             try:
                 w3 = get_w3(rpc)
-                # Quick health check
+                # Strong health check: chain + simple call
                 if w3.eth.chain_id == CHAIN_ID:
+                    # Test eth_call (some public RPCs restrict it)
+                    w3.eth.call({"to": ACTIVATION_REGISTRY, "data": "0x"})
                     print(f"Using RPC: {rpc[:50]}...")
                     return w3
             except Exception as e:
-                print(f"RPC {rpc[:30]}... failed: {str(e)[:50]}, trying next...")
+                print(f"RPC {rpc[:30]}... failed: {str(e)[:60]}, trying next...")
                 continue
         time.sleep(1)  # brief pause before retry
     raise Exception("No working RPC found after attempts. Check your internet or add more RPCs in .env")
