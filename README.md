@@ -110,3 +110,17 @@ Use at your own risk. Gas is real. Slippages on launch pools are brutal.
 
 **Security:** Never put your main wallet private key on a long-lived VPS without additional protections. Consider a dedicated sniper wallet with limited funds. Use a private RPC. Monitor logs.
 
+## Telegram Integration
+Add to `.env`:
+```
+TG_BOT_TOKEN=your_bot_token_from_BotFather
+TG_USER_ID=your_user_id_from_userinfobot
+```
+
+The bot will send notifications for:
+- Startup
+- New pools (with B20 flag)
+- Buy attempts and results
+
+Restart after editing: `sudo systemctl restart b20-bot`
+
