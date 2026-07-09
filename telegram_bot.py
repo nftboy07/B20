@@ -1064,6 +1064,79 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await query.edit_message_text("No config.")
 
+    elif data == "cmd_liq":
+        # For liq, if there are open positions, show for first one, else prompt
+        try:
+            from b20_mainnet_sniper import get_open_positions, find_best_pool, check_pool_liquidity, get_token_price_in_eth
+            opens = get_open_positions(_current_w3)
+            if opens:
+                tok = opens[0]['token']
+                pool, fee = find_best_pool(_current_w3, tok)
+                if pool:
+                    liq = check_pool_liquidity(_current_w3, pool)
+                    price = get_token_price_in_eth(_current_w3, tok)
+                    msg = f"💧 REAL Liq for {tok[:10]}... : {liq/1e18:.4f} ETH (fee {fee})\nPrice ~{price:.10f} ETH"
+                else:
+                    msg = f"No pool for {tok[:10]}. Use /liq <token>"
+            else:
+                msg = "Use /liq <token> for real liquidity (on-chain pool + price)"
+            await query.edit_message_text(msg)
+        except Exception as e:
+            await query.edit_message_text(f"Liq error: {e}. Use /liq <token>")
+
+    elif data == "cmd_simulate":
+        try:
+            from b20_mainnet_sniper import get_open_positions, get_accurate_min_out, find_best_pool
+            opens = get_open_positions(_current_w3)
+            if opens:
+                tok = opens[0]['token']
+                pool, fee = find_best_pool(_current_w3, tok)
+                if not fee: fee=3000
+                amt = 0.003
+                amount_in = _current_w3.to_wei(amt, 'ether')
+                min_out = get_accurate_min_out(_current_w3, tok, fee, amount_in, 2000)
+                msg = f"🧪 REAL Simulate 0.003 ETH on {tok[:10]}... -> ~{min_out / 1e18:.4f} tokens (min out)"
+            else:
+                msg = "Use /simulate <token> <eth> for real Quoter output"
+            await query.edit_message_text(msg)
+        except Exception as e:
+            await query.edit_message_text(f"Sim error: {e}")
+
+    elif data == "cmd_safety":
+        try:
+            from b20_mainnet_sniper import get_open_positions, run_token_safety
+            opens = get_open_positions(_current_w3)
+            if opens:
+                tok = opens[0]['token']
+                res = run_token_safety(_current_w3, tok)
+                msg = f"🛡️ REAL Safety for {tok[:10]}... : {res}"
+            else:
+                msg = "Use /safety <token> for real on-chain checks (liq, honeypot sim, etc)"
+            await query.edit_message_text(msg)
+        except Exception as e:
+            await query.edit_message_text(f"Safety error: {e}")
+
+    elif data == "cmd_perftoken":
+        try:
+            from b20_mainnet_sniper import get_open_positions, get_token_price_in_eth
+            opens = get_open_positions(_current_w3)
+            if opens:
+                p = opens[0]
+                price = get_token_price_in_eth(_current_w3, p['token']) if _current_w3 else 0
+                val = p['held'] * price
+                pnl = val - p['eth_spent']
+                msg = f"📊 REAL Perftoken {p['token'][:10]}...\nHeld: {p['held']:.4f} Spent: {p['eth_spent']:.4f}\nPrice: {price:.10f}\nValue: {val:.6f} PnL: {pnl:.6f}"
+            else:
+                msg = "Use /perftoken <token> for real per-token PnL"
+            await query.edit_message_text(msg)
+        except Exception as e:
+            await query.edit_message_text(f"Error: {e}")
+
+    elif data == "cmd_addblack":
+        await query.edit_message_text("Use /addblack <token> to add (real blacklist update)")
+    elif data == "cmd_remblack":
+        await query.edit_message_text("Use /remblack <token> to remove (real)")
+
     elif data == "cmd_help" or data == "cmd_commands":
         await query.edit_message_text(
             "All commands via text: /help or /list\n"
@@ -1351,8 +1424,18 @@ def get_main_menu_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton("🛑 Kill", callback_data="kill"),
         ],
         [
+            InlineKeyboardButton("💧 Liq", callback_data="cmd_liq"),
+            InlineKeyboardButton("🧪 Simulate", callback_data="cmd_simulate"),
+            InlineKeyboardButton("🛡️ Safety", callback_data="cmd_safety"),
+        ],
+        [
+            InlineKeyboardButton("📊 Perftoken", callback_data="cmd_perftoken"),
+            InlineKeyboardButton("🖤 AddBlack", callback_data="cmd_addblack"),
+            InlineKeyboardButton("🖤 RemBlack", callback_data="cmd_remblack"),
+        ],
+        [
             InlineKeyboardButton("⚙️ Config", callback_data="cmd_config"),
-            InlineKeyboardButton("❓ Help", callback_data="cmd_help"),
+            InlineKeyboardButton("❓ Help / List", callback_data="cmd_help"),
             InlineKeyboardButton("🔄 Menu", callback_data="menu"),
         ],
     ]
