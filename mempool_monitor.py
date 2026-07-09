@@ -15,8 +15,11 @@ from typing import Dict, Callable, Optional, List, Set
 from dataclasses import dataclass
 
 from web3 import Web3
-from web3.providers import WebsocketProvider
-from eth_utils import to_checksum_address, function_signature_hash
+try:
+    from web3.providers import WebsocketProvider
+except ImportError:
+    from web3.providers import WebSocketProvider as WebsocketProvider
+from eth_utils import to_checksum_address
 from eth_abi import decode
 
 logging.basicConfig(
