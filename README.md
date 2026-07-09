@@ -46,6 +46,7 @@ python b20_mainnet_sniper.py --live --create-b20 --salt "your-unique-salt"
 - B20 address detection (0xB20... + `isB20()` call)
 - Flashbots RPC support via env (set as RPC_URL or FLASHBOTS_RPC)
 - Hardcoded chainId=8453 everywhere
+- Expanded TG commands with **real mainnet outputs**: /price /token /pools /tx /ethbalance /history /balance /positions (live held from balanceOf, Quoter price, DB PnL) + dynamic sell % from on-chain balance
 
 ## Critical Safety Notes
 - Always start in dry-run.

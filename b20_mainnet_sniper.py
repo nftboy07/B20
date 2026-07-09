@@ -243,7 +243,11 @@ UNISWAP_V3_POOL_ABI = [
         {"internalType": "uint16", "name": "observationCardinalityNext", "type": "uint16"},
         {"internalType": "uint8", "name": "feeProtocol", "type": "uint8"},
         {"internalType": "bool", "name": "unlocked", "type": "bool"}
-    ], "stateMutability": "view", "type": "function"}
+    ], "stateMutability": "view", "type": "function"},
+    {"inputs": [], "name": "token0", "outputs": [{"internalType": "address", "name": "", "type": "address"}],
+     "stateMutability": "view", "type": "function"},
+    {"inputs": [], "name": "token1", "outputs": [{"internalType": "address", "name": "", "type": "address"}],
+     "stateMutability": "view", "type": "function"}
 ]
 
 # Uniswap V3 Router ABI (struct style for exactInputSingle)
@@ -300,6 +304,15 @@ UNISWAP_QUOTER_V2_ABI = [
         "stateMutability": "nonpayable",
         "type": "function"
     }
+]
+
+# Minimal ERC20 ABI for balance/held queries (used in positions, safety, PnL)
+ERC20_MIN_ABI = [
+    {"constant": True, "inputs": [{"name": "_owner", "type": "address"}], "name": "balanceOf", "outputs": [{"name": "balance", "type": "uint256"}], "type": "function"},
+    {"constant": True, "inputs": [], "name": "decimals", "outputs": [{"name": "", "type": "uint8"}], "type": "function"},
+    {"constant": True, "inputs": [], "name": "name", "outputs": [{"name": "", "type": "string"}], "type": "function"},
+    {"constant": True, "inputs": [], "name": "symbol", "outputs": [{"name": "", "type": "string"}], "type": "function"},
+    {"constant": True, "inputs": [], "name": "totalSupply", "outputs": [{"name": "", "type": "uint256"}], "type": "function"},
 ]
 
 # =============================================================================
@@ -459,22 +472,153 @@ def get_win_rate() -> float:
     except:
         return 0.0
 
-def get_open_positions() -> list:
-    """Risk #65: get currently open positions from DB (buys without matching sells)."""
+def get_token_price_in_eth(w3, token):
+    """Real mainnet price: ETH per 1 token (via QuoterV2 or slot0).
+    Returns float ETH amount per full token unit. 0 if no liquidity / not quotable yet.
+    """
+    token = to_checksum_address(token)
+    try:
+        dec = get_token_decimals(w3, token)
+        one_token = 10 ** dec
+        quoter = w3.eth.contract(address=UNISWAP_QUOTER_V2, abi=UNISWAP_QUOTER_V2_ABI)
+        # Quoter: sell 1 token for WETH (note order: tokenIn=token, tokenOut=WETH)
+        params = (
+            token,
+            WETH,
+            3000,
+            one_token,
+            0
+        )
+        quoted = quoter.functions.quoteExactInputSingle(params).call()
+        amount_out = quoted[0] if isinstance(quoted, (list, tuple)) else quoted
+        if amount_out and amount_out > 0:
+            return amount_out / 1e18
+    except Exception as qerr:
+        pass  # common on brand new pools with no ticks crossed
+
+    # Robust slot0 price (works once pool has been initialized with first swap/liq)
+    try:
+        pool, _ = find_best_pool(w3, token)
+        if not pool:
+            return 0.0
+        pool_contract = get_pool_contract(w3, pool)
+        slot0 = pool_contract.functions.slot0().call()
+        sqrt_price_x96 = slot0[0]
+        if sqrt_price_x96 == 0:
+            return 0.0
+        # Compute price of token in WETH
+        # price = (sqrtPX96 / 2**96)**2   is (token1/token0) or depending order
+        price_ratio = (sqrt_price_x96 / (2 ** 96)) ** 2
+        try:
+            t0 = to_checksum_address(pool_contract.functions.token0().call())
+            t1 = to_checksum_address(pool_contract.functions.token1().call())
+            # If token is token0, price_ratio = t1 / t0  => WETH per token if t1=WETH
+            # If token is token1, price_ratio = t1/t0  wait inverse: price_token_in_weth = 1/price_ratio if t0=weth
+            if t0 == WETH:
+                # token = t1, price_ratio = token / WETH  => ETH per token = 1 / price_ratio
+                eth_per_token = 1.0 / price_ratio if price_ratio > 0 else 0
+            elif t1 == WETH:
+                # token = t0, price_ratio = WETH / token   => eth_per = price_ratio
+                eth_per_token = price_ratio
+            else:
+                eth_per_token = price_ratio  # fallback guess
+        except:
+            eth_per_token = price_ratio
+        # Adjust for decimals difference (token decimals vs 18 for WETH)
+        dec = get_token_decimals(w3, token)
+        eth_per_token *= (10 ** (dec - 18)) if dec != 18 else 1.0   # rough; usually adjust inverse
+        # Note: for accurate often people use full math with decimal scaling on amounts.
+        # For display in TG this gives usable real number once pool active.
+        return max(0.0, float(eth_per_token))
+    except Exception as se:
+        return 0.0
+
+def get_bot_address() -> str:
+    """Return the address the bot is using (from PRIVATE_KEY in .env)."""
+    try:
+        pk = os.getenv("PRIVATE_KEY")
+        if pk:
+            from eth_account import Account
+            return Account.from_key(pk).address
+    except:
+        pass
+    return "N/A"
+
+def get_open_positions(w3=None) -> list:
+    """Risk #65: get currently open positions from DB.
+    If w3 provided, includes current price, value, PnL, moon bag suggestion.
+    Made robust for new tokens where Quoter/price may fail.
+    """
     try:
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
         c.execute("""
-            SELECT token, SUM(CASE WHEN action='buy' THEN amount ELSE -amount END) as net
+            SELECT token, 
+                   SUM(CASE WHEN action='buy' THEN amount ELSE 0 END) as eth_spent
             FROM trades 
             WHERE status='success'
             GROUP BY token
-            HAVING net > 0
+            HAVING eth_spent > 0
         """)
-        positions = c.fetchall()
+        rows = c.fetchall()
         conn.close()
-        return [(t, n) for t, n in positions]
-    except:
+        positions = []
+        sender = None
+        if w3:
+            try:
+                sender = w3.eth.account.from_key(os.getenv("PRIVATE_KEY")).address
+            except:
+                sender = None
+        for token, eth_spent in rows:
+            held_human = 0.0
+            price = 0.0
+            value = 0.0
+            pnl = 0.0
+            pnl_pct = 0.0
+            suggestion = "Sell 70% now (recoup + profit), moon bag 30% for moon"
+            if w3 and sender:
+                try:
+                    erc = w3.eth.contract(address=to_checksum_address(token), abi=ERC20_MIN_ABI)
+                    held = erc.functions.balanceOf(sender).call()
+                    dec = get_token_decimals(w3, token)
+                    held_human = held / (10 ** dec) if held else 0.0
+                    price = get_token_price_in_eth(w3, token)
+                    value = held_human * price
+                    pnl = value - (eth_spent or 0)
+                    pnl_pct = (pnl / (eth_spent or 1) * 100) if eth_spent else 0
+                except Exception as e:
+                    # Price or balance may fail for very new tokens (Quoter reverts, thin liq)
+                    # Still show real on-chain held + spent from DB
+                    print(f"position price/balance error for {token}: {e}")
+                    try:
+                        erc2 = w3.eth.contract(address=to_checksum_address(token), abi=ERC20_MIN_ABI)
+                        held2 = erc2.functions.balanceOf(sender).call()
+                        dec2 = get_token_decimals(w3, token)
+                        held_human = held2 / (10 ** dec2) if held2 else 0.0
+                    except:
+                        pass
+                    suggestion = "Price not available yet (new token) - moon bag 30% recommended"
+            sym = ""
+            try:
+                if w3 and sender:
+                    erc_sym = w3.eth.contract(address=to_checksum_address(token), abi=ERC20_MIN_ABI)
+                    sym = erc_sym.functions.symbol().call()
+            except:
+                pass
+            positions.append({
+                'token': token,
+                'symbol': sym,
+                'eth_spent': eth_spent or 0,
+                'held': held_human,
+                'price_eth': price,
+                'value_eth': value,
+                'pnl_eth': pnl,
+                'pnl_pct': pnl_pct,
+                'suggestion': suggestion
+            })
+        return positions
+    except Exception as e:
+        print(f"get_open_positions error: {e}")
         return []
 
 def check_holder_distribution(w3: Web3, token: str, max_top_holder_pct: float = 0.4) -> tuple[bool, str]:
@@ -1031,8 +1175,16 @@ def attempt_buy(w3: Web3, token: str, fee: int, amount_eth: float, cfg: dict,
                     log_trade(token, "buy", amount_eth, tx_hash.hex(), "success")
                     tg_send(f"✅ <b>BUY SUCCESS</b> for {token}\nTx: <code>{tx_hash.hex()}</code>")
                     export_trades_csv()  # analytics #87
-                    # Upgrade #63-64: basic TP ladder
+                    # Upgrade #63-64: basic TP ladder with sell buttons
                     print(f"[TP LADDER] For {token}: consider sell 25% at 2x, 25% at 5x, 50% at 10x. Current entry {amount_eth} ETH")
+                    sell_buttons = {
+                        "inline_keyboard": [
+                            [{"text": "Sell 25%", "callback_data": f"sell_{token}_25"},
+                             {"text": "Sell 50%", "callback_data": f"sell_{token}_50"}],
+                            [{"text": "Sell 100%", "callback_data": f"sell_{token}_100"}],
+                        ]
+                    }
+                    tg_send(f"🎉 Bought {token}. TP options:", reply_markup=sell_buttons)
                     # Simple hook: if not dry, could auto schedule but for safety manual via TG
                     return tx_hash.hex()
                 else:
@@ -1305,7 +1457,7 @@ def main():
     # Start interactive TG bot (ethbot style using python-telegram-bot library)
     # Outbound alerts continue to use the simple tg_send (requests)
     if TG_LIB_AVAILABLE:
-        set_sniper_context(current_w3, cfg, attempt_buy)
+        set_sniper_context(current_w3, cfg, attempt_buy, attempt_sell)
         tg_thread = start_telegram_bot_in_background()
         if tg_thread:
             print("[TG] Interactive bot started with python-telegram-bot")

@@ -67,7 +67,7 @@ Current state (as of latest): Basic polling monitor, TG alerts, configurable ris
 
 ### 76-85: Telegram Bot & UX [ALL DONE]
 76. ✅ Full interactive TG bot (python-telegram-bot + handlers)
-77. ✅ /status + /positions (DB + enhanced)
+77. ✅ /status + /positions (DB + enhanced) + many more: /price /token /ethbalance /balance /pools /tx /history (real mainnet reads + live balance/PnL/Quoter)
 78. ✅ /pause /resume
 79. ✅ /buy manual (wired to trigger)
 80. ✅ /sell + buttons

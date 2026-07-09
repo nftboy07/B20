@@ -30,6 +30,16 @@ B20_FACTORY = "0xB20f000000000000000000000000000000000000"
 # Uniswap V3 Factory on Base
 UNISWAP_V3_FACTORY = "0x33128a8fC17869897dcE68Ed026d694621f6FDfD"
 
+# Known B20 launch platforms (fill with actual deployer/curve addresses from the sites)
+# User provided: funblue.xyz, basehub.fun/deploy-b20, rwagmi.com, deployb20.xyz, launch.o1.exchange
+B20_LAUNCH_PLATFORMS = {
+    "funblue": "0x0000000000000000000000000000000000000000",  # placeholder, find from funblue create tx
+    "basehub": "0x0000000000000000000000000000000000000000",
+    "rwagmi": "0x0000000000000000000000000000000000000000",
+    "deployb20": "0x0000000000000000000000000000000000000000",
+    "o1": "0x0000000000000000000000000000000000000000",
+}
+
 # Function signatures
 CREATE_B20_SIG = keccak(text="createB20(uint8,bytes32,bytes,bytes[])")[:4].hex()
 POOL_CREATED_SIG = keccak(text="PoolCreated(address,address,uint24,int24,address)")[:4].hex()
@@ -110,6 +120,14 @@ class MempoolMonitor:
             if to_addr == B20_FACTORY.lower() and input_data.startswith("0x" + CREATE_B20_SIG[2:]):
                 await self._handle_b20_creation(tx, tx_hash)
                 return
+
+            # Check for launch platform interactions (new B20 platforms)
+            for platform, addr in B20_LAUNCH_PLATFORMS.items():
+                if addr and to_addr == addr.lower():
+                    print(f"🚀 MEMPOOL LAUNCH PLATFORM DETECTED: {platform} tx {tx_hash}")
+                    if self.on_b20_detected:
+                        await self.on_b20_detected(tx, tx_hash, f"launch_{platform}", platform)
+                    return
 
             # Check for Uniswap V3 PoolCreated (usually from factory, but sometimes direct)
             if to_addr == UNISWAP_V3_FACTORY.lower() and input_data.startswith("0x" + POOL_CREATED_SIG[2:]):

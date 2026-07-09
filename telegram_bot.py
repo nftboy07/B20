@@ -26,6 +26,12 @@ from telegram.ext import (
 )
 from telegram.error import InvalidToken
 
+try:
+    from eth_utils import to_checksum_address
+except Exception:
+    def to_checksum_address(addr):
+        return addr  # minimal fallback if eth-utils not resolved directly
+
 load_dotenv()
 
 # --- Config resolution (ethbot style) ---
@@ -48,15 +54,17 @@ def _get_chat_id() -> str:
 # These will be set by the main sniper before starting the bot
 _current_w3 = None
 _cfg = None
-_buy_callback: Optional[Callable] = None   # function(token: str, amount: float, cfg: dict, w3: Any)
+_buy_callback: Optional[Callable] = None   # function(w3, token, fee, amount, cfg)
+_sell_callback: Optional[Callable] = None  # function(w3, token, fee, amount_token, cfg)
 
 
-def set_sniper_context(w3, cfg: dict, buy_callback: Callable):
-    """Called by main sniper to inject context for buy buttons etc."""
-    global _current_w3, _cfg, _buy_callback
+def set_sniper_context(w3, cfg: dict, buy_callback: Callable, sell_callback: Callable = None):
+    """Called by main sniper to inject context for buy/sell buttons etc."""
+    global _current_w3, _cfg, _buy_callback, _sell_callback
     _current_w3 = w3
     _cfg = cfg
     _buy_callback = buy_callback
+    _sell_callback = sell_callback or buy_callback  # fallback if needed
 
 
 async def _send_control_panel(update_or_chat, context: ContextTypes.DEFAULT_TYPE = None):
@@ -87,23 +95,38 @@ async def _send_control_panel(update_or_chat, context: ContextTypes.DEFAULT_TYPE
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _send_control_panel(update, context)
+    await update.message.reply_text(
+        "More commands (real mainnet):\n"
+        "/status /positions /ethbalance /balance <tok>\n"
+        "/price <tok> /token <tok> /pools <tok>\n"
+        "/history /tx <hash> /buy <tok> <amt> /sell <tok> <pct>\n"
+        "Buttons appear on detections + after buys."
+    )
 
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Enhanced status (upgrade #77) with positions
+    # Enhanced status with real mainnet outputs: addr, ETH bal, buys, winrate, opens
     status_msg = "📊 Bot Status: LIVE mode active.\nMonitoring pools + B20Factory.\nTG interactive + buttons ready.\n"
+    use_w3 = _current_w3
     try:
-        # Try to show active positions if shared, but since separate, use DB
-        import sqlite3
-        conn = sqlite3.connect("/home/ubuntu/b20-bot/b20_trades.db")
-        c = conn.cursor()
-        c.execute("SELECT COUNT(*) FROM trades WHERE status='success' AND action='buy'")
-        buys = c.fetchone()[0]
-        conn.close()
-        status_msg += f"Successful buys so far: {buys}\n"
-    except:
-        pass
-    status_msg += "Check logs for recent snipes.\nUse /positions for trade history."
+        from b20_mainnet_sniper import get_bot_address, get_open_positions, get_win_rate
+        addr = get_bot_address()
+        status_msg += f"Bot wallet: {addr}\n"
+        if use_w3:
+            try:
+                sender = use_w3.eth.account.from_key(os.getenv("PRIVATE_KEY")).address
+                bal_wei = use_w3.eth.get_balance(sender)
+                bal_eth = bal_wei / 1e18
+                status_msg += f"ETH Balance: {bal_eth:.6f} ETH\n"
+            except Exception as be:
+                status_msg += f"ETH Balance: error ({be})\n"
+        opens = get_open_positions(use_w3)
+        status_msg += f"Open positions (DB): {len(opens)}\n"
+        wr = get_win_rate()
+        status_msg += f"Win rate (from buys): {wr:.1f}%\n"
+    except Exception as e:
+        status_msg += f"(some real data unavailable: {e})\n"
+    status_msg += "Use /positions /ethbalance /history /price <tok> for details."
     await update.message.reply_text(status_msg)
 
 
@@ -137,34 +160,59 @@ async def sell_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     token = args[0]
     pct = 100 if len(args) < 2 or args[1].lower() == "all" else float(args[1])
-    await update.message.reply_text(f"🔔 Sell request for {pct}% of {token} received.")
-    if _buy_callback and _current_w3 and _cfg:  # reuse for sell wiring
-        # Note: for full, we'd have a sell_callback. For now trigger via main logic note.
-        # In practice, user uses buttons or main bot for auto.
-        print(f"[TG] Sell request logged for manual follow-up: {token} {pct}%")
+    await update.message.reply_text(f"🔔 Sell request for {pct}% of {token} received. Computing real held balance...")
+    use_w3 = _current_w3
+    if _sell_callback and use_w3 and _cfg:
+        def _do_sell():
+            try:
+                # Compute REAL held amount from on-chain, then pct of it
+                sender = use_w3.eth.account.from_key(os.getenv("PRIVATE_KEY")).address
+                erc = use_w3.eth.contract(address=to_checksum_address(token), abi=[
+                    {"constant":True,"inputs":[{"name":"_owner","type":"address"}],"name":"balanceOf","outputs":[{"name":"balance","type":"uint256"}],"type":"function"},
+                    {"constant":True,"inputs":[],"name":"decimals","outputs":[{"name":"","type":"uint8"}],"type":"function"}
+                ])
+                held = erc.functions.balanceOf(sender).call()
+                dec = erc.functions.decimals().call()
+                sell_amt = int(held * (pct / 100.0)) if held > 0 else 0
+                if sell_amt <= 0:
+                    print("[TG SELL] zero held or computed amount, skipping")
+                    return
+                _sell_callback(use_w3, token, 3000, sell_amt, _cfg)
+            except Exception as be:
+                print(f"[TG SELL] background error: {be}")
+        threading.Thread(target=_do_sell, daemon=True).start()
     else:
         print("[TG] Sell context not available.")
 
 async def positions_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Upgrade #77 + #65: open positions from DB
+    # Real mainnet positions: DB spent + on-chain held balance + PnL using live price
     try:
-        import sqlite3
-        conn = sqlite3.connect("/home/ubuntu/b20-bot/b20_trades.db")
-        c = conn.cursor()
-        c.execute("SELECT token, action, amount, status FROM trades ORDER BY id DESC LIMIT 10")
-        rows = c.fetchall()
-        conn.close()
-        msg = "📊 Recent trades:\n" + "\n".join([f"{r[1]} {r[2]} {r[0][:8]}... {r[3]}" for r in rows]) if rows else "No trades yet."
-        # Open positions
-        try:
-            from b20_mainnet_sniper import get_open_positions
-            opens = get_open_positions()
-            if opens:
-                msg += "\n\nOpen positions:\n" + "\n".join([f"{t[:8]}...: {n}" for t,n in opens])
-        except:
-            pass
-    except:
-        msg = "📊 Positions: DB read error or no trades. Use kill switch if needed."
+        from b20_mainnet_sniper import get_open_positions
+        use_w3 = _current_w3
+        opens = get_open_positions(use_w3)
+        if not opens:
+            msg = "📊 No open positions yet (no successful buys in DB or zero held).\nBuy via buttons or /buy <tok> <eth>"
+        else:
+            msg = "📊 OPEN POSITIONS (real on-chain + DB):\n\n"
+            for p in opens:
+                sym = p.get('symbol', '') or ''
+                tshort = p['token'][:10] + "..."
+                label = f"{sym} {tshort}" if sym else tshort
+                msg += f"Token: {label}\n"
+                msg += f"  Held (on-chain): {p.get('held', 0):.8f}\n"
+                msg += f"  ETH spent (DB): {p.get('eth_spent', 0):.6f}\n"
+                val = p.get('value_eth', 0)
+                if val > 0:
+                    msg += f"  Est Value: {val:.6f} ETH\n"
+                    msg += f"  PnL: {p.get('pnl_eth',0):.6f} ETH ({p.get('pnl_pct',0):.1f}%)\n"
+                else:
+                    msg += "  Est Value: N/A (Quoter/price pending for fresh token)\n"
+                    msg += "  PnL: N/A\n"
+                msg += f"  Strategy: {p.get('suggestion','moon bag 30%')}\n\n"
+            msg += "Moon bag = 30% hold for potential moon. Use /sell <tok> 25 or sell buttons.\n"
+            msg += "Tip: /balance <tok> for exact held, /price <tok> for live quote."
+    except Exception as e:
+        msg = f"📊 Positions error: {e}"
     await update.message.reply_text(msg)
 
 async def blacklist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -194,6 +242,214 @@ async def buy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"Error triggering buy: {e}")
     else:
         await update.message.reply_text("Buy context not fully wired yet. Use buttons or main bot.")
+
+async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Real mainnet balance: /balance [<token>]  (no arg = ETH balance)
+    args = context.args or []
+    use_w3 = _current_w3
+    if not use_w3:
+        await update.message.reply_text("No w3 context.")
+        return
+    try:
+        sender = use_w3.eth.account.from_key(os.getenv("PRIVATE_KEY")).address
+        if not args:
+            # ETH balance
+            bal_wei = use_w3.eth.get_balance(sender)
+            await update.message.reply_text(f"Bot ETH balance: {bal_wei / 1e18:.6f} ETH\nWallet: {sender}")
+            return
+        token = args[0]
+        erc = use_w3.eth.contract(address=to_checksum_address(token), abi=[
+            {"constant":True,"inputs":[{"name":"_owner","type":"address"}],"name":"balanceOf","outputs":[{"name":"balance","type":"uint256"}],"type":"function"},
+            {"constant":True,"inputs":[],"name":"decimals","outputs":[{"name":"","type":"uint8"}],"type":"function"},
+            {"constant":True,"inputs":[],"name":"symbol","outputs":[{"name":"","type":"string"}],"type":"function"}
+        ])
+        bal = erc.functions.balanceOf(sender).call()
+        dec = erc.functions.decimals().call()
+        try:
+            sym = erc.functions.symbol().call()
+        except:
+            sym = ""
+        human = bal / (10 ** dec) if dec else bal
+        await update.message.reply_text(f"Balance {sym} {token[:10]}... : {human}\nRaw: {bal} (dec={dec})\nWallet: {sender}")
+    except Exception as e:
+        await update.message.reply_text(f"Balance error: {e}")
+
+async def address_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show bot's wallet address (the one used for positions and balances)."""
+    use_w3 = _current_w3
+    if use_w3:
+        try:
+            sender = use_w3.eth.account.from_key(os.getenv("PRIVATE_KEY")).address
+            await update.message.reply_text(f"Bot wallet: {sender}\n(This is used for /positions and /balance queries. Make sure it matches your buy tx 'from'.)")
+        except Exception as e:
+            await update.message.reply_text(f"Error: {e}")
+    else:
+        await update.message.reply_text("No w3 context.")
+
+async def price_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Real mainnet price (QuoterV2 or slot0) in ETH per token."""
+    args = context.args or []
+    if not args:
+        await update.message.reply_text("Usage: /price <token>")
+        return
+    token = args[0]
+    use_w3 = _current_w3
+    if use_w3:
+        try:
+            from b20_mainnet_sniper import get_token_price_in_eth, get_token_decimals
+            price = get_token_price_in_eth(use_w3, token)
+            dec = get_token_decimals(use_w3, token)
+            if price > 0:
+                await update.message.reply_text(f"💰 Price {token[:10]}... : {price:.10f} ETH per token\n(dec={dec})")
+            else:
+                await update.message.reply_text(f"Price {token[:10]}... : {price} ETH (0 = no liq/Quoter yet or very new pool)\n(dec={dec})\nTry again after more buys or use /pools")
+        except Exception as e:
+            await update.message.reply_text(f"Price error: {e}")
+    else:
+        await update.message.reply_text("No w3 context.")
+
+async def token_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Real mainnet token info."""
+    args = context.args or []
+    if not args:
+        await update.message.reply_text("Usage: /token <token>")
+        return
+    token = args[0]
+    use_w3 = _current_w3
+    if use_w3:
+        try:
+            erc = use_w3.eth.contract(address=to_checksum_address(token), abi=[
+                {"constant":True,"inputs":[],"name":"name","outputs":[{"name":"","type":"string"}],"type":"function"},
+                {"constant":True,"inputs":[],"name":"symbol","outputs":[{"name":"","type":"string"}],"type":"function"},
+                {"constant":True,"inputs":[],"name":"decimals","outputs":[{"name":"","type":"uint8"}],"type":"function"},
+                {"constant":True,"inputs":[],"name":"totalSupply","outputs":[{"name":"","type":"uint256"}],"type":"function"},
+            ])
+            name = erc.functions.name().call()
+            sym = erc.functions.symbol().call()
+            dec = erc.functions.decimals().call()
+            supply = erc.functions.totalSupply().call()
+            await update.message.reply_text(f"Token {token}\nName: {name}\nSymbol: {sym}\nDecimals: {dec}\nTotalSupply: {supply / (10**dec)}")
+        except Exception as e:
+            await update.message.reply_text(f"Token info error: {e}")
+    else:
+        await update.message.reply_text("No w3 context.")
+
+
+async def ethbalance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Real mainnet ETH balance of the bot wallet."""
+    use_w3 = _current_w3
+    if not use_w3:
+        await update.message.reply_text("No w3 context.")
+        return
+    try:
+        pk = os.getenv("PRIVATE_KEY")
+        sender = use_w3.eth.account.from_key(pk).address if pk else "N/A"
+        bal_wei = use_w3.eth.get_balance(sender)
+        bal = bal_wei / 1e18
+        await update.message.reply_text(f"💎 Bot ETH Balance (mainnet):\n{bal:.8f} ETH\nAddress: {sender}")
+    except Exception as e:
+        await update.message.reply_text(f"ETH balance error: {e}")
+
+
+async def history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Recent trades from DB with real mainnet tx data."""
+    args = context.args or []
+    limit = 5
+    if args:
+        try: limit = max(1, min(20, int(args[0])))
+        except: pass
+    try:
+        import sqlite3
+        db_candidates = ["b20_trades.db", "/home/ubuntu/b20-bot/b20_trades.db"]
+        rows = []
+        for dbp in db_candidates:
+            try:
+                conn = sqlite3.connect(dbp)
+                c = conn.cursor()
+                c.execute("SELECT timestamp, token, action, amount, tx_hash, status FROM trades ORDER BY id DESC LIMIT ?", (limit,))
+                rows = c.fetchall()
+                conn.close()
+                if rows: break
+            except:
+                continue
+        if not rows:
+            await update.message.reply_text("No trade history in DB yet.")
+            return
+        msg = f"📜 Last {len(rows)} trades (mainnet):\n\n"
+        for ts, tok, act, amt, txh, st in rows:
+            short_tok = (tok or "")[:10] + "..."
+            short_tx = (txh or "")[:10] + "..." if txh else "N/A"
+            msg += f"{ts[:19]} {act} {short_tok} amt={amt} {st}\ntx: {short_tx}\n\n"
+        await update.message.reply_text(msg)
+    except Exception as e:
+        await update.message.reply_text(f"History error: {e}")
+
+
+async def pools_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show real mainnet pools + liquidity for a token (multiple fees)."""
+    args = context.args or []
+    if not args:
+        await update.message.reply_text("Usage: /pools <token>")
+        return
+    token = args[0]
+    use_w3 = _current_w3
+    if not use_w3:
+        await update.message.reply_text("No w3 context.")
+        return
+    try:
+        from b20_mainnet_sniper import find_or_wait_pool, check_pool_liquidity, WETH
+        fees = [500, 3000, 10000]
+        lines = [f"Pools for {token} (WETH pairs):"]
+        for fee in fees:
+            pool = find_or_wait_pool(use_w3, WETH, token, fee) or find_or_wait_pool(use_w3, token, WETH, fee)
+            if pool:
+                liq = check_pool_liquidity(use_w3, pool)
+                liq_eth = liq / 1e18 if liq else 0
+                lines.append(f"  fee={fee}: {pool}  liq≈{liq_eth:.4f}")
+            else:
+                lines.append(f"  fee={fee}: no pool")
+        await update.message.reply_text("\n".join(lines))
+    except Exception as e:
+        await update.message.reply_text(f"Pools error: {e}")
+
+
+async def tx_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Real mainnet tx details + receipt (for any tx hash)."""
+    args = context.args or []
+    if not args:
+        await update.message.reply_text("Usage: /tx <0xhash>")
+        return
+    txh = args[0]
+    use_w3 = _current_w3
+    if not use_w3:
+        await update.message.reply_text("No w3 context.")
+        return
+    try:
+        receipt = use_w3.eth.get_transaction_receipt(txh)
+        tx = use_w3.eth.get_transaction(txh)
+        status = "SUCCESS" if receipt.status == 1 else "FAILED"
+        gas_used = receipt.gasUsed
+        block = receipt.blockNumber
+        from_a = tx.get("from", "N/A")
+        to_a = tx.get("to", "N/A")
+        val = tx.get("value", 0) / 1e18
+        msg = (f"Tx {txh}\nStatus: {status}\nBlock: {block}\n"
+               f"From: {from_a}\nTo: {to_a}\nValue: {val} ETH\n"
+               f"Gas used: {gas_used}\n"
+               f"Basescan: https://basescan.org/tx/{txh}")
+        await update.message.reply_text(msg)
+    except Exception as e:
+        await update.message.reply_text(f"Tx lookup error: {e} (may be pending or not indexed)")
+
+
+async def export_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Export trades CSV (real DB data)."""
+    try:
+        from b20_mainnet_sniper import export_trades_csv
+        ok = export_trades_csv("tg_export_trades.csv")
+        await update.message.reply_text("CSV exported to tg_export_trades.csv" if ok else "Export failed (see logs).")
+    except Exception as e:
+        await update.message.reply_text(f"Export error: {e}")
 
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -244,6 +500,35 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.edit_message_text("Buy not available (no w3/cfg yet).")
         except Exception as e:
             await query.edit_message_text(f"Buy button error: {e}")
+    elif data.startswith("sell_"):
+        try:
+            _, tkn, pct_str = data.split("_", 2)
+            pct = float(pct_str)
+            use_w3 = _current_w3
+            if use_w3 and _sell_callback and _cfg:
+                await query.edit_message_text(f"Executing sell {pct}% of {tkn} (real balance)...")
+                def _do_sell():
+                    try:
+                        # Real held amount from on-chain for accurate %
+                        sender = use_w3.eth.account.from_key(os.getenv("PRIVATE_KEY")).address
+                        erc = use_w3.eth.contract(address=to_checksum_address(tkn), abi=[
+                            {"constant":True,"inputs":[{"name":"_owner","type":"address"}],"name":"balanceOf","outputs":[{"name":"balance","type":"uint256"}],"type":"function"},
+                            {"constant":True,"inputs":[],"name":"decimals","outputs":[{"name":"","type":"uint8"}],"type":"function"}
+                        ])
+                        held = erc.functions.balanceOf(sender).call()
+                        dec = erc.functions.decimals().call()
+                        sell_amt = int(held * (pct / 100.0)) if held > 0 else 0
+                        if sell_amt > 0:
+                            _sell_callback(use_w3, tkn, 3000, sell_amt, _cfg)
+                        else:
+                            print("[TG SELL BTN] computed sell_amt=0")
+                    except Exception as be:
+                        print(f"[TG SELL] background error: {be}")
+                threading.Thread(target=_do_sell, daemon=True).start()
+            else:
+                await query.edit_message_text("Sell not available.")
+        except Exception as e:
+            await query.edit_message_text(f"Sell button error: {e}")
 
 
 async def _post_init(application: Application):
@@ -265,6 +550,19 @@ def _build_application(token: str) -> Application:
     app.add_handler(CommandHandler("positions", positions_cmd))
     app.add_handler(CommandHandler("blacklist", blacklist_cmd))
     app.add_handler(CommandHandler("buy", buy_cmd))
+    app.add_handler(CommandHandler("balance", balance_cmd))
+    app.add_handler(CommandHandler("ethbalance", ethbalance_cmd))
+    app.add_handler(CommandHandler("eth", ethbalance_cmd))
+    app.add_handler(CommandHandler("wallet", ethbalance_cmd))
+    app.add_handler(CommandHandler("history", history_cmd))
+    app.add_handler(CommandHandler("trades", history_cmd))
+    app.add_handler(CommandHandler("pools", pools_cmd))
+    app.add_handler(CommandHandler("tx", tx_cmd))
+    app.add_handler(CommandHandler("tokeninfo", token_cmd))
+    app.add_handler(CommandHandler("help", start_cmd))
+    app.add_handler(CommandHandler("commands", start_cmd))
+    app.add_handler(CommandHandler("export", export_cmd))
+    app.add_handler(CommandHandler("csv", export_cmd))
 
     # Inline buttons
     app.add_handler(CallbackQueryHandler(button_callback))
@@ -373,6 +671,20 @@ def get_control_keyboard_dict() -> dict:
             [
                 {"text": "▶️ Resume", "callback_data": "resume"},
                 {"text": "🛑 Kill", "callback_data": "kill"},
+            ],
+        ]
+    }
+
+def get_sell_keyboard_dict(token_address: str) -> dict:
+    """Sell buttons for a bought token (upgrade for TP)."""
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "Sell 25%", "callback_data": f"sell_{token_address}_25"},
+                {"text": "Sell 50%", "callback_data": f"sell_{token_address}_50"},
+            ],
+            [
+                {"text": "Sell 100%", "callback_data": f"sell_{token_address}_100"},
             ],
         ]
     }
