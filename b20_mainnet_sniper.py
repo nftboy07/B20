@@ -1004,8 +1004,15 @@ def monitor_new_pools_and_snipe(w3: Web3, buy_amount_eth: float = 0.05, cfg: dic
 
     last_block = w3.eth.block_number
     seen_pools = set()
+
+    # Initial activation check so we don't miss auto-snipes right at start of monitor
     activated = False
-    last_activation_check = 0
+    try:
+        activated = check_b20_activated(w3, want_stable=False)
+    except Exception:
+        pass
+    flip_alert_sent = activated  # if already true don't spam the flip message
+    last_activation_check = time.time()
 
     # Fixed small amount for automatic meme sniping
     SNIPE_AMOUNT_ETH = 0.001
@@ -1021,8 +1028,9 @@ def monitor_new_pools_and_snipe(w3: Web3, buy_amount_eth: float = 0.05, cfg: dic
             try:
                 activated = check_b20_activated(w3, want_stable=False)
                 last_activation_check = current_time
-                if activated:
+                if activated and not flip_alert_sent:
                     tg_send("🎉 B20 ACTIVATION FLIPPED! Now fully LIVE for real B20 meme sniping (0.001 ETH auto).")
+                    flip_alert_sent = True
             except Exception as act_e:
                 print(f"Activation check error: {act_e}")
 
