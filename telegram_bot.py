@@ -89,8 +89,20 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Enhanced status (upgrade #77)
-    status_msg = "📊 Bot Status: LIVE mode active.\nMonitoring pools + B20Factory.\nTG interactive + buttons ready.\nCheck logs for recent snipes.\nUse /positions for trade history."
+    # Enhanced status (upgrade #77) with positions
+    status_msg = "📊 Bot Status: LIVE mode active.\nMonitoring pools + B20Factory.\nTG interactive + buttons ready.\n"
+    try:
+        # Try to show active positions if shared, but since separate, use DB
+        import sqlite3
+        conn = sqlite3.connect("/home/ubuntu/b20-bot/b20_trades.db")
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM trades WHERE status='success' AND action='buy'")
+        buys = c.fetchone()[0]
+        conn.close()
+        status_msg += f"Successful buys so far: {buys}\n"
+    except:
+        pass
+    status_msg += "Check logs for recent snipes.\nUse /positions for trade history."
     await update.message.reply_text(status_msg)
 
 
@@ -158,8 +170,16 @@ async def buy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /buy <token> <eth_amount>")
         return
     token, amt = args[0], float(args[1])
-    await update.message.reply_text(f"🛒 Manual buy request: {amt} ETH for {token}. (Wired to attempt_buy in main process via callback if set)")
-    # In full integration, this would call the buy callback from main bot context
+    await update.message.reply_text(f"🛒 Manual buy request: {amt} ETH for {token}. Triggering via bot context if available...")
+    if _buy_callback and _current_w3 and _cfg:
+        try:
+            def _manual_buy():
+                _buy_callback(_current_w3, token, 3000, amt, _cfg)
+            threading.Thread(target=_manual_buy, daemon=True).start()
+        except Exception as e:
+            await update.message.reply_text(f"Error triggering buy: {e}")
+    else:
+        await update.message.reply_text("Buy context not fully wired yet. Use buttons or main bot.")
 
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):

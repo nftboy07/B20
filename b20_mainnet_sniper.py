@@ -961,10 +961,9 @@ def attempt_buy(w3: Web3, token: str, fee: int, amount_eth: float, cfg: dict,
                 log_trade(token, "buy", amount_eth, tx_hash.hex(), "success")
                 tg_send(f"✅ <b>BUY SUCCESS</b> for {token}\nTx: <code>{tx_hash.hex()}</code>")
                 export_trades_csv()  # analytics #87
-                # Upgrade risk: basic auto-sell hook (63,64) - call attempt_sell after delay in prod
-                # For now log + TG note
-                if amount_eth > 0.001:  # example threshold
-                    print(f"[AUTO SELL HOOK] Consider selling {token} later")
+                # Upgrade #63-64: basic TP ladder
+                print(f"[TP LADDER] For {token}: consider sell 25% at 2x, 25% at 5x, 50% at 10x. Current entry {amount_eth} ETH")
+                # Simple hook: if not dry, could auto schedule but for safety manual via TG
                 return tx_hash.hex()
             else:
                 print("Buy tx reverted.")
@@ -1132,7 +1131,11 @@ def monitor_new_pools_and_snipe(w3: Web3, buy_amount_eth: float = 0.05, cfg: dic
                             meme = is_meme_like(name, sym)
                             print(f"Detected likely B20 token: {new_token} (isB20={is_b20}, meme_like={meme})")
 
-                            msg = f"🆕 <b>{name} ({sym})</b>\n<code>{new_token}</code>\nPool: <code>{pool}</code> fee={fee} {'[MEME]' if meme else ''}"
+                            # Upgrade #4: watch for initial liquidity adds with exact amounts
+                            initial_liq = check_pool_liquidity(w3, pool)
+                            print(f"Initial liquidity add for {new_token}: {initial_liq} (pool {pool})")
+
+                            msg = f"🆕 <b>{name} ({sym})</b>\n<code>{new_token}</code>\nPool: <code>{pool}</code> fee={fee} liq={initial_liq} {'[MEME]' if meme else ''}"
 
                             buttons = get_buy_keyboard_dict(new_token) if TG_LIB_AVAILABLE else {
                                 "inline_keyboard": [
