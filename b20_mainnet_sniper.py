@@ -82,6 +82,19 @@ except ImportError:
 
 import requests
 
+# ethbot-style interactive Telegram bot
+try:
+    from telegram_bot import (
+        set_sniper_context,
+        start_telegram_bot_in_background,
+        get_buy_keyboard_dict,
+        get_control_keyboard_dict,
+    )
+    TG_LIB_AVAILABLE = True
+except ImportError:
+    TG_LIB_AVAILABLE = False
+    print("telegram_bot (python-telegram-bot) not available, falling back to legacy polling if present")
+
 current_w3 = None
 
 # Persistent session for all Telegram Bot API calls.
@@ -370,151 +383,9 @@ def tg_send(message: str, reply_markup: dict = None) -> bool:
         print(f"[TG] notify failed: {e}")
         return False
 
-def check_tg_commands(cfg: dict, w3=None):
-    """TG commands with inline buttons for control (ethbot-style interactive polling).
-    Supports aliases for token/chat_id.
-    Uses offset file + long-poll. Heavy buys offloaded.
-    On start: clears any webhook so polling works reliably.
-    """
-    token = (cfg.get("TELEGRAM_TOKEN") or cfg.get("BOT_TOKEN") or
-             cfg.get("TG_BOT_TOKEN", ""))
-    chat_id = (cfg.get("ADMIN_CHAT_ID") or cfg.get("TELEGRAM_CHAT_ID") or
-               cfg.get("TG_USER_ID", ""))
-    if not token or not chat_id:
-        return
-
-    # Best practice from ethbot: ensure no webhook is set when using polling
-    try:
-        wh = tg_session.get(f"https://api.telegram.org/bot{token}/getWebhookInfo", timeout=10).json()
-        if wh.get("result", {}).get("url"):
-            tg_session.post(
-                f"https://api.telegram.org/bot{token}/deleteWebhook",
-                json={"drop_pending_updates": True},
-                timeout=10,
-            )
-            print("[TG] Cleared webhook for polling mode")
-    except Exception as e:
-        print(f"[TG] webhook check warning: {e}")
-
-    offset_file = "/home/ubuntu/b20-bot/tg_offset.txt"
-    offset = 0
-    if os.path.exists(offset_file):
-        try:
-            with open(offset_file) as f:
-                offset = int(f.read().strip() or 0)
-        except:
-            offset = 0
-
-    def _execute_buy(use_w3, tkn, amt, cfg):
-        """Run in separate thread so TG polling stays responsive.
-        Refreshes to a good RPC (user paid ones first) for fast quote/tx on button press.
-        """
-        global current_w3
-        try:
-            # Prefer fast RPC for the buy execution itself (critical for button "speed" feel)
-            rpc_list = cfg.get("BACKUP_RPCS", []) or DEFAULT_BASE_RPCS
-            fresh = get_working_w3(rpc_list)
-            current_w3 = fresh
-            use_w3 = fresh
-        except Exception:
-            pass  # fall back to whatever we had
-        try:
-            tg_send(f"Executing buy {amt} ETH on {tkn}...")
-            f = 3000
-            p = find_or_wait_pool(use_w3, WETH, tkn, f) or find_or_wait_pool(use_w3, tkn, WETH, f)
-            if not p:
-                f = 10000
-            attempt_buy(use_w3, tkn, f, amt, cfg, max_retries=1)
-        except Exception as be:
-            tg_send(f"Buy button error: {be}")
-
-    while True:
-        try:
-            # Long polling (ethbot style + our speed upgrades)
-            url = f"https://api.telegram.org/bot{token}/getUpdates?offset={offset}&limit=10&timeout=20"
-            resp = tg_session.get(url, timeout=25).json()
-
-            if not resp.get("ok") or not resp.get("result"):
-                continue
-
-            new_offset = offset
-            for update in resp["result"]:
-                new_offset = update["update_id"] + 1
-
-                # Handle callback_query (buttons)
-                if "callback_query" in update:
-                    cb = update["callback_query"]
-                    data = cb.get("data", "")
-                    cb_id = cb["id"]
-                    # Fast ack + use session + timeout
-                    tg_session.post(
-                        f"https://api.telegram.org/bot{token}/answerCallbackQuery",
-                        json={"callback_query_id": cb_id},
-                        timeout=5
-                    )
-
-                    if data == "status":
-                        tg_send("📊 Bot Status: LIVE mode active. Monitoring pools. Check logs.")
-                    elif data == "pause":
-                        open(cfg.get("KILL_SWITCH_FILE", "/tmp/kill"), 'a').close()
-                        tg_send("⏸️ Paused monitoring.")
-                    elif data == "resume":
-                        kf = cfg.get("KILL_SWITCH_FILE", "/tmp/kill")
-                        if os.path.exists(kf):
-                            os.remove(kf)
-                        tg_send("▶️ Resumed monitoring.")
-                    elif data == "kill":
-                        open(cfg.get("KILL_SWITCH_FILE", "/tmp/kill"), 'a').close()
-                        tg_send("🛑 Kill switch activated.")
-                    elif data.startswith("buy_"):
-                        try:
-                            _, tkn, amt_str = data.split("_", 2)
-                            amt = float(amt_str)
-                            use_w3 = w3 or current_w3
-                            if use_w3:
-                                # IMPORTANT: spawn thread. Do NOT block the long-poll loop with RPCs/tx/wait_receipt.
-                                # This is the main fix for "tg buttons fucking slow".
-                                threading.Thread(
-                                    target=_execute_buy,
-                                    args=(use_w3, tkn, amt, cfg),
-                                    daemon=True
-                                ).start()
-                        except Exception as be:
-                            tg_send(f"Buy button error: {be}")
-
-                    continue
-
-                # Handle text messages
-                msg = update.get("message", {}).get("text", "").strip().lower()
-                if msg == "/start" or msg == "/menu":
-                    buttons = {
-                        "inline_keyboard": [
-                            [{"text": "📊 Status", "callback_data": "status"},
-                             {"text": "⏸️ Pause", "callback_data": "pause"}],
-                            [{"text": "▶️ Resume", "callback_data": "resume"},
-                             {"text": "🛑 Kill", "callback_data": "kill"}]
-                        ]
-                    }
-                    tg_send("B20 Bot Control Panel (LIVE):", reply_markup=buttons)
-                elif msg == "/status":
-                    tg_send("📊 Bot Status: LIVE monitoring active. Use /menu for buttons.")
-                elif msg == "/pause":
-                    open(cfg.get("KILL_SWITCH_FILE", "/tmp/kill"), 'a').close()
-                    tg_send("⏸️ Paused via command.")
-                elif msg == "/resume":
-                    kf = cfg.get("KILL_SWITCH_FILE", "/tmp/kill")
-                    if os.path.exists(kf):
-                        os.remove(kf)
-                    tg_send("▶️ Resumed via command.")
-
-            with open(offset_file, "w") as f:
-                f.write(str(new_offset))
-            offset = new_offset
-        except Exception as e:
-            # Transient network (RemoteDisconnected etc) during long-poll is common.
-            # Recover fast instead of 1s sleep so buttons feel instant.
-            print(f"[TG] command poll error: {e}")
-            time.sleep(0.3)
+# NOTE: Old raw long-poll check_tg_commands has been replaced by
+# the ethbot-style implementation in telegram_bot.py using python-telegram-bot.
+# The old function is removed to avoid duplicate polling.
 
 def is_kill_switch_active(kill_file: str) -> bool:
     return os.path.exists(kill_file)
@@ -1103,7 +974,7 @@ def monitor_new_pools_and_snipe(w3: Web3, buy_amount_eth: float = 0.05, cfg: dic
                             name, sym = get_token_name_symbol(w3, new_token)
                             msg = f"🆕 <b>{name} ({sym})</b>\n<code>{new_token}</code>\nPool: <code>{pool}</code> fee={fee}"
 
-                            buttons = {
+                            buttons = get_buy_keyboard_dict(new_token) if TG_LIB_AVAILABLE else {
                                 "inline_keyboard": [
                                     [{"text": "0.003 ETH", "callback_data": f"buy_{new_token}_0.003"},
                                      {"text": "0.005 ETH", "callback_data": f"buy_{new_token}_0.005"}],
@@ -1177,9 +1048,16 @@ def main():
     global current_w3
     current_w3 = w3
 
-    # Run TG polling in separate thread for faster response to commands/buttons
-    tg_thread = threading.Thread(target=check_tg_commands, args=(cfg, None), daemon=True)
-    tg_thread.start()
+    # Start interactive TG bot (ethbot style using python-telegram-bot library)
+    # Outbound alerts continue to use the simple tg_send (requests)
+    if TG_LIB_AVAILABLE:
+        set_sniper_context(current_w3, cfg, attempt_buy)
+        tg_thread = start_telegram_bot_in_background()
+        if tg_thread:
+            print("[TG] Interactive bot started with python-telegram-bot")
+    else:
+        # Fallback would go here (old raw polling removed in favor of library)
+        print("[TG] python-telegram-bot not installed. Install requirements and restart.")
 
     # Live mode guard
     if not dry_run:
@@ -1208,8 +1086,8 @@ def main():
         print("⚠️  LIVE MODE ENABLED - REAL ETH WILL BE USED")
         tg_send("⚠️ <b>LIVE MODE</b> - Real trades active")
 
-    # Send buttons menu on startup
-    buttons = {
+    # Send buttons menu on startup (ethbot style)
+    buttons = get_control_keyboard_dict() if TG_LIB_AVAILABLE else {
         "inline_keyboard": [
             [{"text": "📊 Status", "callback_data": "status"},
              {"text": "⏸️ Pause", "callback_data": "pause"}],
@@ -1240,7 +1118,7 @@ def main():
             try:
                 def on_b20_mem(tx, txh, st, name="B20"):
                     msg = f"🆕 <b>{name}</b> (MEMPOOL EARLY)\n<code>{tx.get('to', 'N/A')}</code>"
-                    buttons = {
+                    buttons = get_buy_keyboard_dict(tx.get('to', '')) if TG_LIB_AVAILABLE else {
                         "inline_keyboard": [
                             [{"text": "0.003 ETH", "callback_data": f"buy_{tx.get('to', '')}_0.003"},
                              {"text": "0.005 ETH", "callback_data": f"buy_{tx.get('to', '')}_0.005"}],

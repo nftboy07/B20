@@ -4,4 +4,5 @@ eth-utils
 eth-abi
 requests>=2.31.0
 websockets>=11.0
+python-telegram-bot>=21.4
 asyncio  # stdlib but note
