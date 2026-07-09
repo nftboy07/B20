@@ -156,15 +156,22 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         addr = get_bot_address()
         status_msg += f"Bot wallet: {addr}\n"
         if use_w3:
-            try:
-                sender = use_w3.eth.account.from_key(os.getenv("PRIVATE_KEY")).address
-                bal_wei = use_w3.eth.get_balance(sender)
-                bal_eth = bal_wei / 1e18
-                status_msg += f"ETH Balance: {bal_eth:.6f} ETH\n"
-            except Exception as be:
-                status_msg += f"ETH Balance: error ({be})\n"
-        opens = get_open_positions(use_w3)
-        status_msg += f"Open positions (DB): {len(opens)}\n"
+            def _get_bal():
+                try:
+                    sender = use_w3.eth.account.from_key(os.getenv("PRIVATE_KEY")).address
+                    bal_wei = use_w3.eth.get_balance(sender)
+                    return bal_wei / 1e18
+                except Exception as be:
+                    return 0.0
+            loop = asyncio.get_running_loop()
+            bal_eth = await loop.run_in_executor(None, _get_bal)
+            status_msg += f"ETH Balance: {bal_eth:.6f} ETH\n"
+        def _get_opens_len():
+            opens = get_open_positions(use_w3)
+            return len(opens)
+        loop = asyncio.get_running_loop()
+        opens_len = await loop.run_in_executor(None, _get_opens_len)
+        status_msg += f"Open positions (DB): {opens_len}\n"
         wr = get_win_rate()
         status_msg += f"Win rate (from buys): {wr:.1f}%\n"
     except Exception as e:
@@ -837,18 +844,22 @@ async def summary_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     use_w3 = _current_w3
     try:
         from b20_mainnet_sniper import get_total_spent, get_estimated_portfolio_value, get_open_positions, get_win_rate, get_bot_address
-        spent = get_total_spent()
-        val = get_estimated_portfolio_value(use_w3)
-        opens = len(get_open_positions(use_w3))
-        wr = get_win_rate()
-        addr = get_bot_address()
-        eth = 0
-        if use_w3:
-            try:
-                sender = use_w3.eth.account.from_key(os.getenv("PRIVATE_KEY")).address
-                eth = use_w3.eth.get_balance(sender) / 1e18
-            except: pass
-        await update.message.reply_text(f"📋 SUMMARY\nWallet: {addr}\nETH bal: {eth:.4f}\nSpent: {spent:.4f}\nValue: {val:.4f}\nOpens: {opens}\nWinrate: {wr:.1f}%")
+        def _compute_sum():
+            spent = get_total_spent()
+            val = get_estimated_portfolio_value(use_w3)
+            opens = len(get_open_positions(use_w3))
+            wr = get_win_rate()
+            addr = get_bot_address()
+            eth = 0
+            if use_w3:
+                try:
+                    sender = use_w3.eth.account.from_key(os.getenv("PRIVATE_KEY")).address
+                    eth = use_w3.eth.get_balance(sender) / 1e18
+                except: pass
+            return f"📋 SUMMARY\nWallet: {addr}\nETH bal: {eth:.4f}\nSpent: {spent:.4f}\nValue: {val:.4f}\nOpens: {opens}\nWinrate: {wr:.1f}%"
+        loop = asyncio.get_running_loop()
+        msg = await loop.run_in_executor(None, _compute_sum)
+        await update.message.reply_text(msg)
     except Exception as e:
         await update.message.reply_text(f"Error: {e}")
 
@@ -867,47 +878,50 @@ async def profit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     try:
         from b20_mainnet_sniper import get_token_price_in_eth
-        # live held
-        erc = use_w3.eth.contract(address=to_checksum_address(token), abi=[
-            {"constant":True,"inputs":[{"name":"_owner","type":"address"}],"name":"balanceOf","outputs":[{"name":"balance","type":"uint256"}],"type":"function"},
-            {"constant":True,"inputs":[],"name":"decimals","outputs":[{"name":"","type":"uint8"}],"type":"function"}
-        ])
-        sender = use_w3.eth.account.from_key(os.getenv("PRIVATE_KEY")).address
-        held = erc.functions.balanceOf(sender).call()
-        dec = erc.functions.decimals().call()
-        held_human = held / (10 ** dec) if dec else 0
+        def _compute_profit():
+            # live held
+            erc = use_w3.eth.contract(address=to_checksum_address(token), abi=[
+                {"constant":True,"inputs":[{"name":"_owner","type":"address"}],"name":"balanceOf","outputs":[{"name":"balance","type":"uint256"}],"type":"function"},
+                {"constant":True,"inputs":[],"name":"decimals","outputs":[{"name":"","type":"uint8"}],"type":"function"}
+            ])
+            sender = use_w3.eth.account.from_key(os.getenv("PRIVATE_KEY")).address
+            held = erc.functions.balanceOf(sender).call()
+            dec = erc.functions.decimals().call()
+            held_human = held / (10 ** dec) if dec else 0
 
-        price = get_token_price_in_eth(use_w3, token)
-        value = held_human * price
+            price = get_token_price_in_eth(use_w3, token)
+            value = held_human * price
 
-        # spent from DB for this token
-        import sqlite3
-        spent = 0.0
-        conn = sqlite3.connect("b20_trades.db")
-        c = conn.cursor()
-        c.execute("SELECT SUM(amount) FROM trades WHERE lower(token)=lower(?) AND action='buy' AND status='success'", (token,))
-        row = c.fetchone()
-        if row and row[0]:
-            spent = row[0]
-        conn.close()
+            # spent from DB for this token
+            import sqlite3
+            spent = 0.0
+            conn = sqlite3.connect("b20_trades.db")
+            c = conn.cursor()
+            c.execute("SELECT SUM(amount) FROM trades WHERE lower(token)=lower(?) AND action='buy' AND status='success'", (token,))
+            row = c.fetchone()
+            if row and row[0]:
+                spent = row[0]
+            conn.close()
 
-        pnl = value - spent
-        pct = (pnl / spent * 100) if spent > 0 else 0
+            pnl = value - spent
+            pct = (pnl / spent * 100) if spent > 0 else 0
 
-        msg = (f"💰 Profit check for {token[:10]}...\n"
-               f"Held now (live): {held_human:.8f}\n"
-               f"Current price: {price:.10f} ETH\n"
-               f"Current value: {value:.6f} ETH\n"
-               f"ETH spent on buys (DB): {spent:.6f}\n"
-               f"PnL: {pnl:.6f} ETH ({pct:.1f}%)\n\n")
-        if held_human > 0:
-            if pnl > 0:
-                msg += "✅ Looks profitable right now based on live price."
+            msg = (f"💰 Profit check for {token[:10]}...\n"
+                   f"Held now (live): {held_human:.8f}\n"
+                   f"Current price: {price:.10f} ETH\n"
+                   f"Current value: {value:.6f} ETH\n"
+                   f"ETH spent on buys (DB): {spent:.6f}\n"
+                   f"PnL: {pnl:.6f} ETH ({pct:.1f}%)\n\n")
+            if held_human > 0:
+                if pnl > 0:
+                    msg += "✅ Looks profitable right now based on live price."
+                else:
+                    msg += "❌ Currently at a loss (or break-even) based on live price."
             else:
-                msg += "❌ Currently at a loss (or break-even) based on live price."
-        else:
-            msg += "You currently hold 0 of this token on-chain."
-
+                msg += "You currently hold 0 of this token on-chain."
+            return msg
+        loop = asyncio.get_running_loop()
+        msg = await loop.run_in_executor(None, _compute_profit)
         await update.message.reply_text(msg)
     except Exception as e:
         await update.message.reply_text(f"Profit check error: {e}")
@@ -934,7 +948,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
     if data == "cmd_status" or data == "status":
-        # REAL status output
+        # REAL status output - offload blocking web3
         status_msg = "📊 Bot Status: LIVE mode active.\nMonitoring pools + B20Factory.\nTG interactive + buttons ready.\n"
         use_w3 = _current_w3
         try:
@@ -942,13 +956,16 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             addr = get_bot_address()
             status_msg += f"Bot wallet: {addr}\n"
             if use_w3:
-                try:
-                    sender = use_w3.eth.account.from_key(os.getenv("PRIVATE_KEY")).address
-                    bal_wei = use_w3.eth.get_balance(sender)
-                    bal_eth = bal_wei / 1e18
-                    status_msg += f"ETH Balance: {bal_eth:.6f} ETH\n"
-                except:
-                    pass
+                def _get_bal():
+                    try:
+                        sender = use_w3.eth.account.from_key(os.getenv("PRIVATE_KEY")).address
+                        bal_wei = use_w3.eth.get_balance(sender)
+                        return bal_wei / 1e18
+                    except:
+                        return 0.0
+                loop = asyncio.get_running_loop()
+                bal_eth = await loop.run_in_executor(None, _get_bal)
+                status_msg += f"ETH Balance: {bal_eth:.6f} ETH\n"
             n = get_num_open_positions()
             status_msg += f"Open positions: {n}\n"
             wr = get_win_rate()
@@ -1118,7 +1135,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if use_w3:
             try:
                 from b20_mainnet_sniper import get_gas_info
-                g = get_gas_info(use_w3)
+                def _get_gas():
+                    return get_gas_info(use_w3)
+                loop = asyncio.get_running_loop()
+                g = await loop.run_in_executor(None, _get_gas)
                 await query.message.reply_text(f"⛽ REAL Gas: {g.get('gas_price_gwei')} gwei | Base: {g.get('base_fee_gwei')} gwei")
             except Exception as e:
                 await query.message.reply_text(f"Gas error: {e}")
@@ -1130,7 +1150,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if use_w3:
             try:
                 from b20_mainnet_sniper import get_activation_status
-                res = get_activation_status(use_w3)
+                def _get_act():
+                    return get_activation_status(use_w3)
+                loop = asyncio.get_running_loop()
+                res = await loop.run_in_executor(None, _get_act)
                 await query.message.reply_text(f"🔓 {res} (REAL on-chain)")
             except Exception as e:
                 await query.message.reply_text(f"Error: {e}")
@@ -1178,7 +1201,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "cmd_refresh":
         try:
             from b20_mainnet_sniper import get_open_positions
-            opens = get_open_positions(_current_w3)
+            def _get_opens():
+                return get_open_positions(_current_w3)
+            loop = asyncio.get_running_loop()
+            opens = await loop.run_in_executor(None, _get_opens)
             await query.message.reply_text(f"🔄 Refreshed. {len(opens)} positions (real on-chain balances).")
         except Exception as e:
             await query.message.reply_text(f"Refresh error: {e}")
@@ -1186,14 +1212,17 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "cmd_open":
         try:
             from b20_mainnet_sniper import get_open_positions
-            opens = get_open_positions(_current_w3)
+            def _get_opens():
+                return get_open_positions(_current_w3, include_price=False)
+            loop = asyncio.get_running_loop()
+            opens = await loop.run_in_executor(None, _get_opens)
             if not opens:
                 msg = "No open positions."
             else:
                 msg = "📂 Open (REAL):\n" + "\n".join([f"- {p.get('symbol','') or p['token'][:8]}... held:{p['held']:.2f}" for p in opens])
-            await query.edit_message_text(msg)
+            await query.message.reply_text(msg)
         except Exception as e:
-            await query.edit_message_text(f"Error: {e}")
+            await query.message.reply_text(f"Error: {e}")
 
     elif data == "cmd_export":
         try:
@@ -1215,18 +1244,21 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # For liq, if there are open positions, show for first one, else prompt
         try:
             from b20_mainnet_sniper import get_open_positions, find_best_pool, check_pool_liquidity, get_token_price_in_eth
-            opens = get_open_positions(_current_w3)
-            if opens:
-                tok = opens[0]['token']
-                pool, fee = find_best_pool(_current_w3, tok)
-                if pool:
-                    liq = check_pool_liquidity(_current_w3, pool)
-                    price = get_token_price_in_eth(_current_w3, tok)
-                    msg = f"💧 REAL Liq for {tok[:10]}... : {liq/1e18:.4f} ETH (fee {fee})\nPrice ~{price:.10f} ETH"
+            def _get_liq():
+                opens = get_open_positions(_current_w3)
+                if opens:
+                    tok = opens[0]['token']
+                    pool, fee = find_best_pool(_current_w3, tok)
+                    if pool:
+                        liq = check_pool_liquidity(_current_w3, pool)
+                        price = get_token_price_in_eth(_current_w3, tok)
+                        return f"💧 REAL Liq for {tok[:10]}... : {liq/1e18:.4f} ETH (fee {fee})\nPrice ~{price:.10f} ETH"
+                    else:
+                        return f"No pool for {tok[:10]}. Use /liq <token>"
                 else:
-                    msg = f"No pool for {tok[:10]}. Use /liq <token>"
-            else:
-                msg = "Use /liq <token> for real liquidity (on-chain pool + price)"
+                    return "Use /liq <token> for real liquidity (on-chain pool + price)"
+            loop = asyncio.get_running_loop()
+            msg = await loop.run_in_executor(None, _get_liq)
             await query.message.reply_text(msg)
         except Exception as e:
             await query.message.reply_text(f"Liq error: {e}. Use /liq <token>")
@@ -1234,17 +1266,20 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "cmd_simulate":
         try:
             from b20_mainnet_sniper import get_open_positions, get_accurate_min_out, find_best_pool
-            opens = get_open_positions(_current_w3)
-            if opens:
-                tok = opens[0]['token']
-                pool, fee = find_best_pool(_current_w3, tok)
-                if not fee: fee=3000
-                amt = 0.003
-                amount_in = _current_w3.to_wei(amt, 'ether')
-                min_out = get_accurate_min_out(_current_w3, tok, fee, amount_in, 2000)
-                msg = f"🧪 REAL Simulate 0.003 ETH on {tok[:10]}... -> ~{min_out / 1e18:.4f} tokens (min out)"
-            else:
-                msg = "Use /simulate <token> <eth> for real Quoter output"
+            def _get_sim():
+                opens = get_open_positions(_current_w3)
+                if opens:
+                    tok = opens[0]['token']
+                    pool, fee = find_best_pool(_current_w3, tok)
+                    if not fee: fee=3000
+                    amt = 0.003
+                    amount_in = _current_w3.to_wei(amt, 'ether')
+                    min_out = get_accurate_min_out(_current_w3, tok, fee, amount_in, 2000)
+                    return f"🧪 REAL Simulate 0.003 ETH on {tok[:10]}... -> ~{min_out / 1e18:.4f} tokens (min out)"
+                else:
+                    return "Use /simulate <token> <eth> for real Quoter output"
+            loop = asyncio.get_running_loop()
+            msg = await loop.run_in_executor(None, _get_sim)
             await query.message.reply_text(msg)
         except Exception as e:
             await query.message.reply_text(f"Sim error: {e}")
@@ -1252,13 +1287,16 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "cmd_safety":
         try:
             from b20_mainnet_sniper import get_open_positions, run_token_safety
-            opens = get_open_positions(_current_w3)
-            if opens:
-                tok = opens[0]['token']
-                res = run_token_safety(_current_w3, tok)
-                msg = f"🛡️ REAL Safety for {tok[:10]}... : {res}"
-            else:
-                msg = "Use /safety <token> for real on-chain checks (liq, honeypot sim, etc)"
+            def _get_safety():
+                opens = get_open_positions(_current_w3)
+                if opens:
+                    tok = opens[0]['token']
+                    res = run_token_safety(_current_w3, tok)
+                    return f"🛡️ REAL Safety for {tok[:10]}... : {res}"
+                else:
+                    return "Use /safety <token> for real on-chain checks (liq, honeypot sim, etc)"
+            loop = asyncio.get_running_loop()
+            msg = await loop.run_in_executor(None, _get_safety)
             await query.message.reply_text(msg)
         except Exception as e:
             await query.message.reply_text(f"Safety error: {e}")
@@ -1266,15 +1304,18 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "cmd_perftoken":
         try:
             from b20_mainnet_sniper import get_open_positions, get_token_price_in_eth
-            opens = get_open_positions(_current_w3)
-            if opens:
-                p = opens[0]
-                price = get_token_price_in_eth(_current_w3, p['token']) if _current_w3 else 0
-                val = p['held'] * price
-                pnl = val - p['eth_spent']
-                msg = f"📊 REAL Perftoken {p['token'][:10]}...\nHeld: {p['held']:.4f} Spent: {p['eth_spent']:.4f}\nPrice: {price:.10f}\nValue: {val:.6f} PnL: {pnl:.6f}"
-            else:
-                msg = "Use /perftoken <token> for real per-token PnL"
+            def _get_perf():
+                opens = get_open_positions(_current_w3)
+                if opens:
+                    p = opens[0]
+                    price = get_token_price_in_eth(_current_w3, p['token']) if _current_w3 else 0
+                    val = p['held'] * price
+                    pnl = val - p['eth_spent']
+                    return f"📊 REAL Perftoken {p['token'][:10]}...\nHeld: {p['held']:.4f} Spent: {p['eth_spent']:.4f}\nPrice: {price:.10f}\nValue: {val:.6f} PnL: {pnl:.6f}"
+                else:
+                    return "Use /perftoken <token> for real per-token PnL"
+            loop = asyncio.get_running_loop()
+            msg = await loop.run_in_executor(None, _get_perf)
             await query.message.reply_text(msg)
         except Exception as e:
             await query.message.reply_text(f"Error: {e}")
