@@ -68,19 +68,11 @@ def set_sniper_context(w3, cfg: dict, buy_callback: Callable, sell_callback: Cal
 
 
 async def _send_control_panel(update_or_chat, context: ContextTypes.DEFAULT_TYPE = None):
-    """Show the main control buttons."""
-    keyboard = [
-        [
-            InlineKeyboardButton("📊 Status", callback_data="status"),
-            InlineKeyboardButton("⏸️ Pause", callback_data="pause"),
-        ],
-        [
-            InlineKeyboardButton("▶️ Resume", callback_data="resume"),
-            InlineKeyboardButton("🛑 Kill", callback_data="kill"),
-        ],
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    text = "B20 Bot Control Panel (LIVE):"
+    """Show the rich main menu with buttons for almost all commands.
+    All button outputs use real mainnet data (on-chain calls, real DB, Quoter etc).
+    """
+    reply_markup = get_main_menu_keyboard()
+    text = "B20 Bot Main Menu (LIVE - All data is REAL mainnet):"
 
     if hasattr(update_or_chat, "message"):
         # from command
@@ -88,8 +80,6 @@ async def _send_control_panel(update_or_chat, context: ContextTypes.DEFAULT_TYPE
     else:
         # from callback or direct
         chat_id = update_or_chat
-        # We use a global app bot if available, but for simplicity we rely on the main tg_send for now
-        # The library bot is available inside handlers
         pass  # handled in caller for now
 
 
@@ -851,8 +841,31 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data or ""
     chat_id = query.message.chat_id
 
-    if data == "status":
-        await query.edit_message_text("📊 Bot Status: LIVE mode active. Monitoring pools. Check logs.")
+    if data == "cmd_status" or data == "status":
+        # REAL status output
+        status_msg = "📊 Bot Status: LIVE mode active.\nMonitoring pools + B20Factory.\nTG interactive + buttons ready.\n"
+        use_w3 = _current_w3
+        try:
+            from b20_mainnet_sniper import get_bot_address, get_open_positions, get_win_rate
+            addr = get_bot_address()
+            status_msg += f"Bot wallet: {addr}\n"
+            if use_w3:
+                try:
+                    sender = use_w3.eth.account.from_key(os.getenv("PRIVATE_KEY")).address
+                    bal_wei = use_w3.eth.get_balance(sender)
+                    bal_eth = bal_wei / 1e18
+                    status_msg += f"ETH Balance: {bal_eth:.6f} ETH\n"
+                except:
+                    pass
+            opens = get_open_positions(use_w3)
+            status_msg += f"Open positions: {len(opens)}\n"
+            wr = get_win_rate()
+            status_msg += f"Win rate: {wr:.1f}%\n"
+        except Exception as e:
+            status_msg += f"(some data error: {e})\n"
+        status_msg += "Use /positions /pnl etc for details. All data is LIVE mainnet."
+        await query.edit_message_text(status_msg)
+
     elif data == "pause":
         if _cfg:
             kf = _cfg.get("KILL_SWITCH_FILE", "/tmp/kill")
@@ -869,6 +882,199 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             kf = _cfg.get("KILL_SWITCH_FILE", "/tmp/kill")
             open(kf, "a").close()
         await query.edit_message_text("🛑 Kill switch activated.")
+
+    elif data == "cmd_pnl":
+        use_w3 = _current_w3
+        try:
+            from b20_mainnet_sniper import get_total_spent, get_estimated_portfolio_value, get_open_positions, get_win_rate
+            spent = get_total_spent()
+            value = get_estimated_portfolio_value(use_w3)
+            pnl = value - spent
+            opens = get_open_positions(use_w3)
+            wr = get_win_rate()
+            msg = (f"📈 PNL SUMMARY (REAL mainnet)\n"
+                   f"Total ETH spent: {spent:.6f}\n"
+                   f"Est. value: {value:.6f}\n"
+                   f"Overall PnL: {pnl:.6f} ETH\n"
+                   f"Open positions: {len(opens)}\n"
+                   f"Win rate: {wr:.1f}%")
+            await query.edit_message_text(msg)
+        except Exception as e:
+            await query.edit_message_text(f"PnL error: {e}")
+
+    elif data == "cmd_value":
+        use_w3 = _current_w3
+        try:
+            from b20_mainnet_sniper import get_estimated_portfolio_value
+            val = get_estimated_portfolio_value(use_w3)
+            await query.edit_message_text(f"💰 REAL Est. portfolio value: {val:.6f} ETH")
+        except Exception as e:
+            await query.edit_message_text(f"Value error: {e}")
+
+    elif data == "cmd_spent":
+        try:
+            from b20_mainnet_sniper import get_total_spent
+            spent = get_total_spent()
+            await query.edit_message_text(f"💸 REAL Total ETH spent: {spent:.6f} ETH")
+        except Exception as e:
+            await query.edit_message_text(f"Spent error: {e}")
+
+    elif data == "cmd_summary":
+        use_w3 = _current_w3
+        try:
+            from b20_mainnet_sniper import get_total_spent, get_estimated_portfolio_value, get_open_positions, get_win_rate, get_bot_address
+            spent = get_total_spent()
+            val = get_estimated_portfolio_value(use_w3)
+            opens = len(get_open_positions(use_w3))
+            wr = get_win_rate()
+            addr = get_bot_address()
+            eth = 0.0
+            if use_w3:
+                try:
+                    sender = use_w3.eth.account.from_key(os.getenv("PRIVATE_KEY")).address
+                    eth = use_w3.eth.get_balance(sender) / 1e18
+                except: pass
+            msg = f"📋 SUMMARY (REAL)\nWallet: {addr}\nETH bal: {eth:.4f}\nSpent: {spent:.4f}\nValue: {val:.4f}\nOpens: {opens}\nWinrate: {wr:.1f}%"
+            await query.edit_message_text(msg)
+        except Exception as e:
+            await query.edit_message_text(f"Error: {e}")
+
+    elif data == "cmd_positions":
+        try:
+            from b20_mainnet_sniper import get_open_positions
+            opens = get_open_positions(_current_w3)
+            if not opens:
+                msg = "📊 No open positions."
+            else:
+                msg = "📊 OPEN POSITIONS (REAL on-chain + DB):\n\n"
+                for p in opens:
+                    sym = p.get('symbol', '') or ''
+                    tshort = p['token'][:10] + "..."
+                    label = f"{sym} {tshort}" if sym else tshort
+                    msg += f"{label}\n  Acquired: {p.get('acquired',0):.6f} Held: {p.get('held',0):.6f}\n  Spent: {p.get('eth_spent',0):.6f}\n"
+                    if p.get('entry_price_eth', 0) > 0:
+                        msg += f"  Entry: {p['entry_price_eth']:.10f} ETH/token\n"
+                    val = p.get('value_eth', 0)
+                    if val > 0:
+                        msg += f"  Value: {val:.6f} PnL: {p.get('pnl_eth',0):.6f}\n"
+                    else:
+                        msg += "  Value/PnL: N/A (fresh token)\n"
+                    if p.get('note'):
+                        msg += f"  ⚠️ {p['note']}\n"
+                    msg += "\n"
+            await query.edit_message_text(msg[:4000])
+        except Exception as e:
+            await query.edit_message_text(f"Positions error: {e}")
+
+    elif data == "cmd_gas":
+        use_w3 = _current_w3
+        if use_w3:
+            try:
+                from b20_mainnet_sniper import get_gas_info
+                g = get_gas_info(use_w3)
+                await query.edit_message_text(f"⛽ REAL Gas: {g.get('gas_price_gwei')} gwei | Base: {g.get('base_fee_gwei')} gwei")
+            except Exception as e:
+                await query.edit_message_text(f"Gas error: {e}")
+        else:
+            await query.edit_message_text("No w3 context.")
+
+    elif data == "cmd_activation":
+        use_w3 = _current_w3
+        if use_w3:
+            try:
+                from b20_mainnet_sniper import get_activation_status
+                res = get_activation_status(use_w3)
+                await query.edit_message_text(f"🔓 {res} (REAL on-chain)")
+            except Exception as e:
+                await query.edit_message_text(f"Error: {e}")
+        else:
+            await query.edit_message_text("No w3.")
+
+    elif data == "cmd_rpc":
+        if _cfg:
+            rpc = _cfg.get('RPC_URL', 'N/A')[:50]
+            backups = len(_cfg.get('BACKUP_RPCS', []))
+            await query.edit_message_text(f"🌐 Current RPC: {rpc}...\nBackups: {backups} (real failover list)")
+        else:
+            await query.edit_message_text("No config.")
+
+    elif data == "cmd_history" or data == "cmd_recent":
+        # real recent
+        try:
+            import sqlite3
+            conn = sqlite3.connect("b20_trades.db")
+            c = conn.cursor()
+            c.execute("SELECT timestamp, token, action, amount, tx_hash, status, COALESCE(token_amount,0) FROM trades ORDER BY id DESC LIMIT 5")
+            rows = c.fetchall()
+            conn.close()
+            if not rows:
+                msg = "No history."
+            else:
+                msg = "📜 Recent (REAL DB):\n"
+                for ts, tok, act, amt, txh, st, acq in rows:
+                    short_tok = (tok or "")[:8] + "..."
+                    msg += f"{ts[:16]} {act} {short_tok} amt={amt} acq={acq:.2f} {st}\n"
+            await query.edit_message_text(msg)
+        except Exception as e:
+            await query.edit_message_text(f"History error: {e}")
+
+    elif data == "cmd_stats":
+        try:
+            from b20_mainnet_sniper import get_detailed_stats, get_win_rate
+            st = get_detailed_stats()
+            wr = get_win_rate()
+            msg = f"📊 STATS (REAL)\nBuys: {st['successful_buys']}\nSpent: {st['total_spent']:.4f}\nSells: {st['sells']}\nWinrate: {wr:.1f}%"
+            await query.edit_message_text(msg)
+        except Exception as e:
+            await query.edit_message_text(f"Stats error: {e}")
+
+    elif data == "cmd_refresh":
+        try:
+            from b20_mainnet_sniper import get_open_positions
+            opens = get_open_positions(_current_w3)
+            await query.edit_message_text(f"🔄 Refreshed. {len(opens)} positions (real on-chain balances).")
+        except Exception as e:
+            await query.edit_message_text(f"Refresh error: {e}")
+
+    elif data == "cmd_open":
+        try:
+            from b20_mainnet_sniper import get_open_positions
+            opens = get_open_positions(_current_w3)
+            if not opens:
+                msg = "No open positions."
+            else:
+                msg = "📂 Open (REAL):\n" + "\n".join([f"- {p.get('symbol','') or p['token'][:8]}... held:{p['held']:.2f}" for p in opens])
+            await query.edit_message_text(msg)
+        except Exception as e:
+            await query.edit_message_text(f"Error: {e}")
+
+    elif data == "cmd_export":
+        try:
+            from b20_mainnet_sniper import export_trades_csv
+            ok = export_trades_csv("tg_export_trades.csv")
+            await query.edit_message_text("CSV exported (real DB)." if ok else "Export failed.")
+        except Exception as e:
+            await query.edit_message_text(f"Error: {e}")
+
+    elif data == "cmd_config":
+        if _cfg:
+            safe = {k: v for k, v in _cfg.items() if not any(x in k for x in ['KEY', 'TOKEN', 'RPC'])}
+            msg = "⚙️ Config (REAL):\n" + "\n".join(f"{k}: {v}" for k, v in list(safe.items())[:10])
+            await query.edit_message_text(msg)
+        else:
+            await query.edit_message_text("No config.")
+
+    elif data == "cmd_help" or data == "cmd_commands":
+        await query.edit_message_text(
+            "All commands via text: /help or /list\n"
+            "Menu buttons cover the main ones.\n"
+            "All data shown is REAL (on-chain Quoter, balanceOf, DB queries, etc).\n"
+            "No dummies."
+        )
+
+    elif data == "menu":
+        # refresh the main menu
+        await query.edit_message_text("B20 Bot Main Menu (LIVE - Real data):", reply_markup=get_main_menu_keyboard())
     elif data.startswith("buy_"):
         try:
             _, tkn, amt_str = data.split("_", 2)
@@ -1075,15 +1281,21 @@ def get_buy_keyboard_dict(token_address: str) -> dict:
 
 
 def get_control_keyboard_dict() -> dict:
+    """Used for outbound alerts. Rich version with real data buttons."""
     return {
         "inline_keyboard": [
             [
-                {"text": "📊 Status", "callback_data": "status"},
-                {"text": "⏸️ Pause", "callback_data": "pause"},
+                {"text": "📊 Status", "callback_data": "cmd_status"},
+                {"text": "📈 PnL", "callback_data": "cmd_pnl"},
+                {"text": "📍 Positions", "callback_data": "cmd_positions"},
             ],
             [
+                {"text": "⏸️ Pause", "callback_data": "pause"},
                 {"text": "▶️ Resume", "callback_data": "resume"},
                 {"text": "🛑 Kill", "callback_data": "kill"},
+            ],
+            [
+                {"text": "🔄 Menu", "callback_data": "menu"},
             ],
         ]
     }
@@ -1101,6 +1313,50 @@ def get_sell_keyboard_dict(token_address: str) -> dict:
             ],
         ]
     }
+
+
+def get_main_menu_keyboard() -> InlineKeyboardMarkup:
+    """Comprehensive main menu with buttons for (almost) all commands.
+    All outputs from these will use real on-chain/DB data.
+    """
+    keyboard = [
+        [
+            InlineKeyboardButton("📊 Status", callback_data="cmd_status"),
+            InlineKeyboardButton("📈 PnL", callback_data="cmd_pnl"),
+            InlineKeyboardButton("📋 Summary", callback_data="cmd_summary"),
+        ],
+        [
+            InlineKeyboardButton("📍 Positions", callback_data="cmd_positions"),
+            InlineKeyboardButton("💰 Value", callback_data="cmd_value"),
+            InlineKeyboardButton("💸 Spent", callback_data="cmd_spent"),
+        ],
+        [
+            InlineKeyboardButton("⛽ Gas", callback_data="cmd_gas"),
+            InlineKeyboardButton("🔓 Activation", callback_data="cmd_activation"),
+            InlineKeyboardButton("🌐 RPC", callback_data="cmd_rpc"),
+        ],
+        [
+            InlineKeyboardButton("📜 History", callback_data="cmd_history"),
+            InlineKeyboardButton("📊 Stats", callback_data="cmd_stats"),
+            InlineKeyboardButton("🕒 Recent", callback_data="cmd_recent"),
+        ],
+        [
+            InlineKeyboardButton("🔄 Refresh", callback_data="cmd_refresh"),
+            InlineKeyboardButton("📂 Open", callback_data="cmd_open"),
+            InlineKeyboardButton("📤 Export", callback_data="cmd_export"),
+        ],
+        [
+            InlineKeyboardButton("⏸️ Pause", callback_data="pause"),
+            InlineKeyboardButton("▶️ Resume", callback_data="resume"),
+            InlineKeyboardButton("🛑 Kill", callback_data="kill"),
+        ],
+        [
+            InlineKeyboardButton("⚙️ Config", callback_data="cmd_config"),
+            InlineKeyboardButton("❓ Help", callback_data="cmd_help"),
+            InlineKeyboardButton("🔄 Menu", callback_data="menu"),
+        ],
+    ]
+    return InlineKeyboardMarkup(keyboard)
 
 
 if __name__ == "__main__":
