@@ -63,6 +63,7 @@ import argparse
 import random
 import threading
 import asyncio
+import traceback
 from datetime import datetime, timezone
 from typing import Optional, Tuple, Dict, Any
 
@@ -148,6 +149,17 @@ DEFAULT_BASE_RPCS = [
 ACTIVATION_REGISTRY = to_checksum_address("0x8453000000000000000000000000000000000001")
 POLICY_REGISTRY     = to_checksum_address("0x8453000000000000000000000000000000000002")
 B20_FACTORY         = to_checksum_address("0xB20f000000000000000000000000000000000000")
+
+# Known B20 launch platforms from user (for enhanced detection and alerts)
+# To fill addresses: for a new token from one of these sites, look up its creation tx on basescan, see the 'to' or internal create call to B20Factory or launcher.
+# Then add the launcher/deployer address here for mempool early signal on pending creates.
+B20_LAUNCH_PLATFORMS = {
+    "funblue": None,  # funblue.xyz - curve launches for B20
+    "basehub": None,  # basehub.fun/deploy-b20
+    "rwagmi": None,   # rwagmi.com - B20 create/manage
+    "deployb20": None, # deployb20.xyz - launcher + MCP
+    "o1": None,       # launch.o1.exchange - launchpad
+}
 
 UNISWAP_V3_FACTORY  = to_checksum_address("0x33128a8fC17869897dcE68Ed026d694621f6FDfD")
 UNISWAP_V3_ROUTER   = to_checksum_address("0xE592427A0AEce92De3Edee1F18E0157C05861564")
@@ -446,6 +458,24 @@ def get_win_rate() -> float:
         return (successes / len(buys)) * 100
     except:
         return 0.0
+
+def get_open_positions() -> list:
+    """Risk #65: get currently open positions from DB (buys without matching sells)."""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("""
+            SELECT token, SUM(CASE WHEN action='buy' THEN amount ELSE -amount END) as net
+            FROM trades 
+            WHERE status='success'
+            GROUP BY token
+            HAVING net > 0
+        """)
+        positions = c.fetchall()
+        conn.close()
+        return [(t, n) for t, n in positions]
+    except:
+        return []
 
 def check_holder_distribution(w3: Web3, token: str, max_top_holder_pct: float = 0.4) -> tuple[bool, str]:
     """Safety upgrade #24: basic holder concentration check (simplified on-chain)."""
@@ -801,14 +831,16 @@ def create_b20_live(w3: Web3, variant: int, salt: bytes, params: bytes, init_cal
 
     # Build tx
     nonce = w3.eth.get_transaction_count(sender)
-    max_fee = get_gas_price_with_premium(w3, gas_premium)
+    priority_fee = w3.to_wei(2, "gwei")
+    base_fee = w3.eth.get_block("latest").get("baseFeePerGas", 0) or w3.eth.gas_price
+    max_fee = int(base_fee * (1 + gas_premium / 100)) + priority_fee
 
     tx = factory.functions.createB20(variant, salt, params, init_calls).build_transaction({
         "from": sender,
         "nonce": nonce,
         "chainId": CHAIN_ID,
         "maxFeePerGas": max_fee,
-        "maxPriorityFeePerGas": w3.to_wei(2, "gwei"),
+        "maxPriorityFeePerGas": priority_fee,
         "value": 0,
     })
 
@@ -964,53 +996,64 @@ def attempt_buy(w3: Web3, token: str, fee: int, amount_eth: float, cfg: dict,
     print(f"Using Quoter + dynamic slippage {slippage_bps/100}% (liq~{liq_eth:.1f} ETH) → min_out={min_out}")
 
     for attempt in range(max_retries + 1):
-        tx = build_buy_tx(w3, token, fee, amount_in, min_out, sender)
-        max_fee = get_gas_price_with_premium(w3, 50 + attempt * 50)
-        tx["maxFeePerGas"] = max_fee
-        tx["maxPriorityFeePerGas"] = w3.to_wei(3 + attempt, "gwei")
-        tx["nonce"] = w3.eth.get_transaction_count(sender)
-        gas = estimate_gas_with_buffer(w3, tx, buffer=1.6 + attempt * 0.3)
-        tx["gas"] = gas
-
-        print(f"Buy attempt {attempt+1}: amount={amount_eth} ETH, gas={gas}, maxFee={max_fee}")
-
-        # Optional: simulate first
         try:
-            w3.eth.call({**tx, "from": sender}, "pending")
-        except Exception as e:
-            print(f"eth_call simulation revert: {e}")
-            if attempt == 0:
-                continue  # try again with worse params
+            tx = build_buy_tx(w3, token, fee, amount_in, min_out, sender)
+            # Fix for "max priority fee per gas higher than max fee per gas"
+            # Compute properly: maxFee = base * multiplier + priority
+            priority_fee = w3.to_wei(3 + attempt, "gwei")
+            base_fee = w3.eth.get_block("latest").get("baseFeePerGas", 0) or w3.eth.gas_price
+            max_fee = int(base_fee * (1 + (50 + attempt * 50) / 100)) + priority_fee
+            tx["maxFeePerGas"] = max_fee
+            tx["maxPriorityFeePerGas"] = priority_fee
+            tx["nonce"] = w3.eth.get_transaction_count(sender)
+            gas = estimate_gas_with_buffer(w3, tx, buffer=1.6 + attempt * 0.3)
+            tx["gas"] = gas
 
-        signed = account.sign_transaction(tx)
-        try:
-            tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-            print("Buy tx sent:", tx_hash.hex())
-            tg_send(f"💰 Buy tx sent for <code>{token}</code>\nAmount: {amount_eth} ETH\nTx: <code>{tx_hash.hex()}</code>")
-            receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=90)
-            if receipt.status == 1:
-                print("BUY SUCCESS:", tx_hash.hex())
-                log_trade(token, "buy", amount_eth, tx_hash.hex(), "success")
-                tg_send(f"✅ <b>BUY SUCCESS</b> for {token}\nTx: <code>{tx_hash.hex()}</code>")
-                export_trades_csv()  # analytics #87
-                # Upgrade #63-64: basic TP ladder
-                print(f"[TP LADDER] For {token}: consider sell 25% at 2x, 25% at 5x, 50% at 10x. Current entry {amount_eth} ETH")
-                # Simple hook: if not dry, could auto schedule but for safety manual via TG
-                return tx_hash.hex()
-            else:
-                print("Buy tx reverted.")
-                tg_send(f"❌ Buy tx reverted for {token}")
-        except Exception as e:
-            print(f"Send error: {e}")
-            tg_send(f"❌ Buy error for {token}: {str(e)[:100]}")
+            print(f"Buy attempt {attempt+1}: amount={amount_eth} ETH, gas={gas}, maxFee={max_fee}, priority={priority_fee}")
 
-        # Per spec: if failed, retry immediately with higher gas / lower slippage (we already loosen on retry)
-        if attempt < max_retries:
-            time.sleep(0.5)
-            # Re-check liquidity still exists
-            if check_pool_liquidity(w3, pool) == 0:
-                print("Liquidity disappeared. Aborting retries.")
-                break
+            # Optional: simulate first (best effort for sniping; send on last attempt even if fails)
+            try:
+                w3.eth.call({**tx, "from": sender}, "pending")
+            except Exception as e:
+                print(f"eth_call simulation revert: {e}")
+                if attempt < max_retries:
+                    continue  # retry with looser on early attempts
+
+            # Send the tx (even if sim failed on final attempt)
+            signed = account.sign_transaction(tx)
+            try:
+                tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+                print("Buy tx sent:", tx_hash.hex())
+                tg_send(f"💰 Buy tx sent for <code>{token}</code>\nAmount: {amount_eth} ETH\nTx: <code>{tx_hash.hex()}</code>")
+                receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=90)
+                if receipt.status == 1:
+                    print("BUY SUCCESS:", tx_hash.hex())
+                    log_trade(token, "buy", amount_eth, tx_hash.hex(), "success")
+                    tg_send(f"✅ <b>BUY SUCCESS</b> for {token}\nTx: <code>{tx_hash.hex()}</code>")
+                    export_trades_csv()  # analytics #87
+                    # Upgrade #63-64: basic TP ladder
+                    print(f"[TP LADDER] For {token}: consider sell 25% at 2x, 25% at 5x, 50% at 10x. Current entry {amount_eth} ETH")
+                    # Simple hook: if not dry, could auto schedule but for safety manual via TG
+                    return tx_hash.hex()
+                else:
+                    print("Buy tx reverted.")
+                    tg_send(f"❌ Buy tx reverted for {token}")
+            except Exception as e:
+                print(f"Send error: {e}")
+                tg_send(f"❌ Buy error for {token}: {str(e)[:100]}")
+                traceback.print_exc()
+
+            # Per spec: if failed, retry immediately with higher gas / lower slippage (we already loosen on retry)
+            if attempt < max_retries:
+                time.sleep(0.5)
+                # Re-check liquidity still exists
+                if check_pool_liquidity(w3, pool) == 0:
+                    print("Liquidity disappeared. Aborting retries.")
+                    break
+        except Exception as e:
+            print(f"Buy loop error in attempt {attempt}: {e}")
+            traceback.print_exc()
+            break
 
     return None
 
@@ -1043,9 +1086,11 @@ def attempt_sell(w3: Web3, token: str, fee: int, amount_token: int, cfg: dict, m
         "from": sender,
         "chainId": CHAIN_ID,
     })
-    max_fee = get_gas_price_with_premium(w3, 50)
+    priority_fee = w3.to_wei(2, "gwei")
+    base_fee = w3.eth.get_block("latest").get("baseFeePerGas", 0) or w3.eth.gas_price
+    max_fee = int(base_fee * (1 + 50 / 100)) + priority_fee
     tx["maxFeePerGas"] = max_fee
-    tx["maxPriorityFeePerGas"] = w3.to_wei(2, "gwei")
+    tx["maxPriorityFeePerGas"] = priority_fee
     tx["nonce"] = w3.eth.get_transaction_count(sender)
     gas = estimate_gas_with_buffer(w3, tx)
     tx["gas"] = gas

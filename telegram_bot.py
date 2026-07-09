@@ -146,15 +146,23 @@ async def sell_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         print("[TG] Sell context not available.")
 
 async def positions_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Upgrade #77: real status from DB + ACTIVE
+    # Upgrade #77 + #65: open positions from DB
     try:
         import sqlite3
         conn = sqlite3.connect("/home/ubuntu/b20-bot/b20_trades.db")
         c = conn.cursor()
-        c.execute("SELECT token, action, amount, status FROM trades ORDER BY id DESC LIMIT 5")
+        c.execute("SELECT token, action, amount, status FROM trades ORDER BY id DESC LIMIT 10")
         rows = c.fetchall()
         conn.close()
         msg = "📊 Recent trades:\n" + "\n".join([f"{r[1]} {r[2]} {r[0][:8]}... {r[3]}" for r in rows]) if rows else "No trades yet."
+        # Open positions
+        try:
+            from b20_mainnet_sniper import get_open_positions
+            opens = get_open_positions()
+            if opens:
+                msg += "\n\nOpen positions:\n" + "\n".join([f"{t[:8]}...: {n}" for t,n in opens])
+        except:
+            pass
     except:
         msg = "📊 Positions: DB read error or no trades. Use kill switch if needed."
     await update.message.reply_text(msg)
