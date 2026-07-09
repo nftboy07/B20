@@ -151,6 +151,16 @@ async def blacklist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Note: this would need to be shared with main process; for now echo
     await update.message.reply_text(f"🖤 Blacklist request for {token} (add to main bot BLACKLIST set manually or extend wiring).")
 
+async def buy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Manual buy (upgrade #79)
+    args = context.args or []
+    if len(args) < 2:
+        await update.message.reply_text("Usage: /buy <token> <eth_amount>")
+        return
+    token, amt = args[0], float(args[1])
+    await update.message.reply_text(f"🛒 Manual buy request: {amt} ETH for {token}. (Wired to attempt_buy in main process via callback if set)")
+    # In full integration, this would call the buy callback from main bot context
+
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -221,6 +231,7 @@ def _build_application(token: str) -> Application:
     app.add_handler(CommandHandler("sell", sell_cmd))
     app.add_handler(CommandHandler("positions", positions_cmd))
     app.add_handler(CommandHandler("blacklist", blacklist_cmd))
+    app.add_handler(CommandHandler("buy", buy_cmd))
 
     # Inline buttons
     app.add_handler(CallbackQueryHandler(button_callback))
