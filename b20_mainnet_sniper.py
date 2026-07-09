@@ -278,8 +278,9 @@ def load_config() -> Dict[str, Any]:
         "MIN_LIQUIDITY_ETH": float(os.getenv("MIN_LIQUIDITY_ETH", "5.0")),
         "SLIPPAGE_BPS": int(os.getenv("SLIPPAGE_BPS", "2000")),
         "KILL_SWITCH_FILE": os.getenv("KILL_SWITCH_FILE", "/home/ubuntu/b20-bot/KILL_SWITCH"),
-        "TG_BOT_TOKEN": os.getenv("TG_BOT_TOKEN", ""),
-        "TG_USER_ID": os.getenv("TG_USER_ID", ""),
+        # Telegram - support ethbot-style names + legacy
+        "TELEGRAM_TOKEN": os.getenv("TELEGRAM_TOKEN") or os.getenv("BOT_TOKEN") or os.getenv("TG_BOT_TOKEN", ""),
+        "ADMIN_CHAT_ID": os.getenv("ADMIN_CHAT_ID") or os.getenv("TELEGRAM_CHAT_ID") or os.getenv("TG_USER_ID", ""),
     }
     user_rpcs = [r.strip() for r in os.getenv("BACKUP_RPCS", "").split(",") if r.strip()]
     cfg["BACKUP_RPCS"] = user_rpcs + [r for r in DEFAULT_BASE_RPCS if r not in user_rpcs]  # user first, then defaults, no dups
@@ -300,7 +301,7 @@ def mask_sensitive(value: str, show_last: int = 4) -> str:
 def get_safe_config(cfg: dict) -> dict:
     """Return a copy of config with all sensitive values masked. Leak-proof for logs."""
     safe = cfg.copy()
-    for k in ["PRIVATE_KEY", "TG_BOT_TOKEN", "FLASHBOTS_RPC"]:
+    for k in ["PRIVATE_KEY", "TELEGRAM_TOKEN", "TG_BOT_TOKEN", "FLASHBOTS_RPC"]:
         if k in safe and safe[k]:
             safe[k] = mask_sensitive(safe[k])
     if "BACKUP_RPCS" in safe:
@@ -341,40 +342,60 @@ def get_working_w3(rpc_list: list = None, max_attempts: int = 5) -> Web3:
 # =============================================================================
 # TELEGRAM NOTIFICATIONS (optional)
 # =============================================================================
-def tg_send(message: str, reply_markup: dict = None):
-    """Send message to Telegram if TG_BOT_TOKEN and TG_USER_ID are set in .env.
-    Supports optional inline keyboard buttons for commands.
-    Uses persistent session for speed.
+def tg_send(message: str, reply_markup: dict = None) -> bool:
+    """Send message (ethbot-style send_alert).
+    Supports aliases: TELEGRAM_TOKEN / BOT_TOKEN / TG_BOT_TOKEN
+    and ADMIN_CHAT_ID / TELEGRAM_CHAT_ID / TG_USER_ID.
+    Uses persistent session. Truncates to 4000 chars. Returns success.
     """
-    token = os.getenv("TG_BOT_TOKEN")
-    user_id = os.getenv("TG_USER_ID")
-    if not token or not user_id:
-        return
+    token = (os.getenv("TELEGRAM_TOKEN") or os.getenv("BOT_TOKEN") or
+             os.getenv("TG_BOT_TOKEN") or "")
+    chat_id = (os.getenv("ADMIN_CHAT_ID") or os.getenv("TELEGRAM_CHAT_ID") or
+               os.getenv("TG_USER_ID") or "")
+    if not token or not chat_id:
+        return False
     try:
         url = f"https://api.telegram.org/bot{token}/sendMessage"
         payload = {
-            "chat_id": user_id,
-            "text": message,
+            "chat_id": chat_id,
+            "text": str(message)[:4000],
             "parse_mode": "HTML",
-            "disable_web_page_preview": True
+            "disable_web_page_preview": True,
         }
         if reply_markup:
             payload["reply_markup"] = reply_markup
-        tg_session.post(url, json=payload, timeout=8)
+        r = tg_session.post(url, json=payload, timeout=15)
+        return r.ok
     except Exception as e:
         print(f"[TG] notify failed: {e}")
+        return False
 
 def check_tg_commands(cfg: dict, w3=None):
-    """TG commands with inline buttons for control.
-    Supports /start to show buttons, and callback buttons for pause/resume/status + buy buttons.
-    Uses offset file to avoid reprocessing updates.
-    Runs in own thread + persistent session + long-poll (timeout=20) for ~instant button response.
-    Heavy buy work is offloaded to background threads so the poll loop NEVER blocks.
+    """TG commands with inline buttons for control (ethbot-style interactive polling).
+    Supports aliases for token/chat_id.
+    Uses offset file + long-poll. Heavy buys offloaded.
+    On start: clears any webhook so polling works reliably.
     """
-    token = cfg.get("TG_BOT_TOKEN", "")
-    user_id = cfg.get("TG_USER_ID", "")
-    if not token or not user_id:
+    token = (cfg.get("TELEGRAM_TOKEN") or cfg.get("BOT_TOKEN") or
+             cfg.get("TG_BOT_TOKEN", ""))
+    chat_id = (cfg.get("ADMIN_CHAT_ID") or cfg.get("TELEGRAM_CHAT_ID") or
+               cfg.get("TG_USER_ID", ""))
+    if not token or not chat_id:
         return
+
+    # Best practice from ethbot: ensure no webhook is set when using polling
+    try:
+        wh = tg_session.get(f"https://api.telegram.org/bot{token}/getWebhookInfo", timeout=10).json()
+        if wh.get("result", {}).get("url"):
+            tg_session.post(
+                f"https://api.telegram.org/bot{token}/deleteWebhook",
+                json={"drop_pending_updates": True},
+                timeout=10,
+            )
+            print("[TG] Cleared webhook for polling mode")
+    except Exception as e:
+        print(f"[TG] webhook check warning: {e}")
+
     offset_file = "/home/ubuntu/b20-bot/tg_offset.txt"
     offset = 0
     if os.path.exists(offset_file):
@@ -409,9 +430,7 @@ def check_tg_commands(cfg: dict, w3=None):
 
     while True:
         try:
-            # Long polling with high timeout for near-instant response when update arrives.
-            # No extra sleep - loop immediately for next poll.
-            # Session keeps connection warm to avoid RemoteDisconnected / slow reconnects.
+            # Long polling (ethbot style + our speed upgrades)
             url = f"https://api.telegram.org/bot{token}/getUpdates?offset={offset}&limit=10&timeout=20"
             resp = tg_session.get(url, timeout=25).json()
 
