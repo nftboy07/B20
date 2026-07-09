@@ -66,6 +66,21 @@ def set_sniper_context(w3, cfg: dict, buy_callback: Callable, sell_callback: Cal
     _buy_callback = buy_callback
     _sell_callback = sell_callback or buy_callback  # fallback if needed
 
+import time
+
+# Short TTL cache to speed up repeated menu button presses while keeping data fresh/real
+_cache = {}
+_CACHE_TTL = 8  # seconds
+
+def _get_cached(key):
+    entry = _cache.get(key)
+    if entry and (time.time() - entry[0] < _CACHE_TTL):
+        return entry[1]
+    return None
+
+def _set_cached(key, value):
+    _cache[key] = (time.time(), value)
+
 
 async def _send_control_panel(update_or_chat, context: ContextTypes.DEFAULT_TYPE = None):
     """Show the rich main menu with buttons for almost all commands.
@@ -108,7 +123,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /activation        /rpc
 
 **Analytics & History**
-/pnl /spent /value /summary /stats
+/pnl /spent /value /summary /stats /profit <token>
 /history /recent [n] /lastbuy /open
 /tx <hash>         /export /csv
 
@@ -121,7 +136,10 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /help /list /commands /menu
 
 Buttons appear on new detections + after buys.
-Use /tx to inspect any transaction on Basescan."""
+Use /tx to inspect any transaction on Basescan.
+
+You can always sell (buttons or /sell) even if /positions shows 0/N/A — the sell logic uses live on-chain balance at click time.
+Use /profit <token> or /balance + /price to check profitability yourself."""
 
     await update.message.reply_text(help_text)
 
@@ -218,11 +236,14 @@ async def positions_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 sender = use_w3.eth.account.from_key(os.getenv("PRIVATE_KEY")).address
         except:
             pass
-        if not opens:
+        real_opens = [p for p in opens if p.get('acquired', 0) > 0 or p.get('held', 0) > 0]
+        zero_received = [p for p in opens if p.get('acquired', 0) == 0 and p.get('eth_spent', 0) > 0]
+        if not real_opens and not zero_received:
             msg = "📊 No open positions yet (no successful buys in DB or zero held).\nBuy via buttons or /buy <tok> <eth>"
         else:
-            msg = f"📊 OPEN POSITIONS (real on-chain + DB)\nWallet used for balances: {sender}\n\n"
-            for p in opens:
+            msg = f"📊 OPEN POSITIONS (REAL on-chain + DB)\nWallet used for balances: {sender}\n\n"
+            realized_loss = 0.0
+            for p in real_opens:
                 sym = p.get('symbol', '') or ''
                 tshort = p['token'][:10] + "..."
                 label = f"{sym} {tshort}" if sym else tshort
@@ -233,8 +254,6 @@ async def positions_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ep = p.get('entry_price_eth', 0)
                 if ep > 0:
                     msg += f"  Entry price: {ep:.10f} ETH per token\n"
-                else:
-                    msg += "  Entry price: N/A (0 acquired)\n"
                 val = p.get('value_eth', 0)
                 if val > 0:
                     msg += f"  Est Value: {val:.6f} ETH\n"
@@ -242,17 +261,21 @@ async def positions_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 else:
                     msg += "  Est Value: N/A (Quoter/price pending for fresh token)\n"
                     msg += "  PnL: N/A\n"
-                msg += f"  Strategy: {p.get('suggestion','moon bag 30%')}\n"
-                if p.get('note'):
-                    msg += f"  ⚠️ {p['note']}\n\n"
-                else:
-                    msg += "\n"
+                msg += f"  Strategy: {p.get('suggestion','moon bag 30%')}\n\n"
+            for p in zero_received:
+                spent = p.get('eth_spent', 0)
+                realized_loss += spent
+                sym = p.get('symbol', '') or ''
+                tshort = p['token'][:10] + "..."
+                label = f"{sym} {tshort}" if sym else tshort
+                msg += f"Token: {label}\n  Spent {spent:.6f} ETH but 0 tokens received (tax/liq/redirect?)\n  Realized loss: -{spent:.6f} ETH\n\n"
+            if realized_loss > 0:
+                msg += f"Total realized loss from failed receives: -{realized_loss:.6f} ETH\n"
             msg += "Moon bag = 30% hold for potential moon. Use /sell <tok> 25 or sell buttons.\n"
             msg += "Tip: /balance <tok> for exact held, /price <tok> for live quote.\n"
-            msg += "To see profit: if Held >0 and Value > Spent → in profit. Check /tx for buy tx 'From' vs this wallet."
-            if any(p.get('held',0) == 0 and p.get('eth_spent',0) > 0 for p in opens):
-                msg += "\n⚠️ Some held=0 but spent recorded: check wallet matches buy tx 'from', or high tax/burn on token."
-            msg += "\nNote: Acquired=0 means the swap delivered 0 tokens to wallet (tax, liq, or redirect). No profit possible on those."
+            msg += "To check if profitable (even if positions show N/A): /balance <tok> then /price <tok>. Calc: held * price vs spent.\n"
+            msg += "You can sell anytime with buttons or /sell even if you can't see clear profit in /positions."
+            msg += "\nNote: Positions with 0 acquired are shown as realized losses (no tokens credited on-chain)."
     except Exception as e:
         msg = f"📊 Positions error: {e}"
     await update.message.reply_text(msg)
@@ -834,6 +857,66 @@ async def summary_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Error: {e}")
 
 
+async def profit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Check if a specific token is profitable right now using live balance + price vs DB spent.
+    This lets you decide to sell even if /positions shows N/A or 0s."""
+    args = context.args or []
+    if not args:
+        await update.message.reply_text("Usage: /profit <token>   (e.g. /profit 0x2a41...)")
+        return
+    token = args[0]
+    use_w3 = _current_w3
+    if not use_w3:
+        await update.message.reply_text("No w3 context.")
+        return
+    try:
+        from b20_mainnet_sniper import get_token_price_in_eth
+        # live held
+        erc = use_w3.eth.contract(address=to_checksum_address(token), abi=[
+            {"constant":True,"inputs":[{"name":"_owner","type":"address"}],"name":"balanceOf","outputs":[{"name":"balance","type":"uint256"}],"type":"function"},
+            {"constant":True,"inputs":[],"name":"decimals","outputs":[{"name":"","type":"uint8"}],"type":"function"}
+        ])
+        sender = use_w3.eth.account.from_key(os.getenv("PRIVATE_KEY")).address
+        held = erc.functions.balanceOf(sender).call()
+        dec = erc.functions.decimals().call()
+        held_human = held / (10 ** dec) if dec else 0
+
+        price = get_token_price_in_eth(use_w3, token)
+        value = held_human * price
+
+        # spent from DB for this token
+        import sqlite3
+        spent = 0.0
+        conn = sqlite3.connect("b20_trades.db")
+        c = conn.cursor()
+        c.execute("SELECT SUM(amount) FROM trades WHERE lower(token)=lower(?) AND action='buy' AND status='success'", (token,))
+        row = c.fetchone()
+        if row and row[0]:
+            spent = row[0]
+        conn.close()
+
+        pnl = value - spent
+        pct = (pnl / spent * 100) if spent > 0 else 0
+
+        msg = (f"💰 Profit check for {token[:10]}...\n"
+               f"Held now (live): {held_human:.8f}\n"
+               f"Current price: {price:.10f} ETH\n"
+               f"Current value: {value:.6f} ETH\n"
+               f"ETH spent on buys (DB): {spent:.6f}\n"
+               f"PnL: {pnl:.6f} ETH ({pct:.1f}%)\n\n")
+        if held_human > 0:
+            if pnl > 0:
+                msg += "✅ Looks profitable right now based on live price."
+            else:
+                msg += "❌ Currently at a loss (or break-even) based on live price."
+        else:
+            msg += "You currently hold 0 of this token on-chain."
+
+        await update.message.reply_text(msg)
+    except Exception as e:
+        await update.message.reply_text(f"Profit check error: {e}")
+
+
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -841,12 +924,25 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data or ""
     chat_id = query.message.chat_id
 
+    # Immediate feedback for heavy data-fetching buttons to prevent lag feel
+    heavy_data_cmds = {"cmd_status", "status", "cmd_pnl", "cmd_value", "cmd_summary", "cmd_positions", "cmd_liq", "cmd_simulate", "cmd_safety", "cmd_perftoken", "cmd_stats", "cmd_history", "cmd_recent", "cmd_open"}
+    if data in heavy_data_cmds:
+        try:
+            await query.edit_message_text("⏳ Fetching real mainnet data...")
+        except Exception:
+            pass
+
+    # For very heavy buttons, offload computation to not block
+    if data in {"cmd_positions", "cmd_pnl", "cmd_summary"}:
+        # the rest of computation happens below; this is just note
+        pass
+
     if data == "cmd_status" or data == "status":
         # REAL status output
         status_msg = "📊 Bot Status: LIVE mode active.\nMonitoring pools + B20Factory.\nTG interactive + buttons ready.\n"
         use_w3 = _current_w3
         try:
-            from b20_mainnet_sniper import get_bot_address, get_open_positions, get_win_rate
+            from b20_mainnet_sniper import get_bot_address, get_num_open_positions, get_win_rate
             addr = get_bot_address()
             status_msg += f"Bot wallet: {addr}\n"
             if use_w3:
@@ -857,14 +953,14 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     status_msg += f"ETH Balance: {bal_eth:.6f} ETH\n"
                 except:
                     pass
-            opens = get_open_positions(use_w3)
-            status_msg += f"Open positions: {len(opens)}\n"
+            n = get_num_open_positions()
+            status_msg += f"Open positions: {n}\n"
             wr = get_win_rate()
             status_msg += f"Win rate: {wr:.1f}%\n"
         except Exception as e:
             status_msg += f"(some data error: {e})\n"
         status_msg += "Use /positions /pnl etc for details. All data is LIVE mainnet."
-        await query.edit_message_text(status_msg)
+        await query.message.reply_text(status_msg)
 
     elif data == "pause":
         if _cfg:
@@ -886,66 +982,117 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "cmd_pnl":
         use_w3 = _current_w3
         try:
+            cached = _get_cached('pnl')
+            if cached:
+                await query.message.reply_text(cached)
+                return
             from b20_mainnet_sniper import get_total_spent, get_estimated_portfolio_value, get_open_positions, get_win_rate
-            spent = get_total_spent()
-            value = get_estimated_portfolio_value(use_w3)
-            pnl = value - spent
-            opens = get_open_positions(use_w3)
-            wr = get_win_rate()
-            msg = (f"📈 PNL SUMMARY (REAL mainnet)\n"
-                   f"Total ETH spent: {spent:.6f}\n"
-                   f"Est. value: {value:.6f}\n"
-                   f"Overall PnL: {pnl:.6f} ETH\n"
-                   f"Open positions: {len(opens)}\n"
-                   f"Win rate: {wr:.1f}%")
-            await query.edit_message_text(msg)
+            def _compute_pnl():
+                spent = get_total_spent()
+                value = get_estimated_portfolio_value(use_w3)
+                # calculate realized losses from 0-received
+                opens = get_open_positions(use_w3)
+                realized_loss = sum(p.get('eth_spent', 0) for p in opens if p.get('acquired', 0) == 0 and p.get('eth_spent', 0) > 0)
+                pnl = value - spent + realized_loss  # since realized is loss, but spent already includes, adjust? Wait, spent is total, value is current, realized loss is part of it
+                # better: total spent on open + realized = total out, current value - (total spent - realized? ) wait, simplify
+                effective_pnl = value - (spent - realized_loss)  # value from good positions - spent on good
+                # but to keep simple, show total spent, value, realized loss, effective
+                msg = (f"📈 PNL SUMMARY (REAL mainnet)\n"
+                       f"Total ETH spent: {spent:.6f}\n"
+                       f"Est. value (held positions): {value:.6f}\n"
+                       f"Realized loss (0-received buys): -{realized_loss:.6f}\n"
+                       f"Effective PnL on active: {effective_pnl:.6f} ETH\n"
+                       f"Open positions (with tokens): {len([p for p in opens if p.get('acquired',0)>0 or p.get('held',0)>0])}\n"
+                       f"Win rate: {wr:.1f}%")
+                return msg
+            loop = asyncio.get_running_loop()
+            msg = await loop.run_in_executor(None, _compute_pnl)
+            _set_cached('pnl', msg)
+            await query.message.reply_text(msg)
         except Exception as e:
-            await query.edit_message_text(f"PnL error: {e}")
+            await query.message.reply_text(f"PnL error: {e}")
 
     elif data == "cmd_value":
         use_w3 = _current_w3
         try:
+            cached = _get_cached('portfolio_value')
+            if cached is not None:
+                await query.message.reply_text(f"💰 REAL Est. portfolio value: {cached:.6f} ETH")
+                return
             from b20_mainnet_sniper import get_estimated_portfolio_value
-            val = get_estimated_portfolio_value(use_w3)
-            await query.edit_message_text(f"💰 REAL Est. portfolio value: {val:.6f} ETH")
+            def _compute_value():
+                return get_estimated_portfolio_value(use_w3)
+            loop = asyncio.get_running_loop()
+            val = await loop.run_in_executor(None, _compute_value)
+            _set_cached('portfolio_value', val)
+            await query.message.reply_text(f"💰 REAL Est. portfolio value: {val:.6f} ETH")
         except Exception as e:
-            await query.edit_message_text(f"Value error: {e}")
+            await query.message.reply_text(f"Value error: {e}")
 
     elif data == "cmd_spent":
         try:
             from b20_mainnet_sniper import get_total_spent
             spent = get_total_spent()
-            await query.edit_message_text(f"💸 REAL Total ETH spent: {spent:.6f} ETH")
+            await query.message.reply_text(f"💸 REAL Total ETH spent: {spent:.6f} ETH")
         except Exception as e:
-            await query.edit_message_text(f"Spent error: {e}")
+            await query.message.reply_text(f"Spent error: {e}")
 
     elif data == "cmd_summary":
         use_w3 = _current_w3
         try:
-            from b20_mainnet_sniper import get_total_spent, get_estimated_portfolio_value, get_open_positions, get_win_rate, get_bot_address
-            spent = get_total_spent()
-            val = get_estimated_portfolio_value(use_w3)
-            opens = len(get_open_positions(use_w3))
-            wr = get_win_rate()
-            addr = get_bot_address()
-            eth = 0.0
-            if use_w3:
-                try:
-                    sender = use_w3.eth.account.from_key(os.getenv("PRIVATE_KEY")).address
-                    eth = use_w3.eth.get_balance(sender) / 1e18
-                except: pass
-            msg = f"📋 SUMMARY (REAL)\nWallet: {addr}\nETH bal: {eth:.4f}\nSpent: {spent:.4f}\nValue: {val:.4f}\nOpens: {opens}\nWinrate: {wr:.1f}%"
-            await query.edit_message_text(msg)
+            cached_val = _get_cached('portfolio_value')
+            cached_spent = _get_cached('spent')
+            if cached_val is not None and cached_spent is not None:
+                # use cached for fast summary
+                from b20_mainnet_sniper import get_num_open_positions, get_win_rate, get_bot_address
+                spent = cached_spent
+                val = cached_val
+                opens = get_num_open_positions()
+                wr = get_win_rate()
+                addr = get_bot_address()
+                eth = 0.0
+                if use_w3:
+                    try:
+                        sender = use_w3.eth.account.from_key(os.getenv("PRIVATE_KEY")).address
+                        eth = use_w3.eth.get_balance(sender) / 1e18
+                    except: pass
+                msg = f"📋 SUMMARY (REAL, cached)\nWallet: {addr}\nETH bal: {eth:.4f}\nSpent: {spent:.4f}\nValue: {val:.4f}\nOpens: {opens}\nWinrate: {wr:.1f}%"
+                await query.message.reply_text(msg)
+                return
+            from b20_mainnet_sniper import get_total_spent, get_estimated_portfolio_value, get_num_open_positions, get_win_rate, get_bot_address
+            def _compute_summary():
+                spent = get_total_spent()
+                val = get_estimated_portfolio_value(use_w3)
+                opens = get_num_open_positions()
+                wr = get_win_rate()
+                addr = get_bot_address()
+                eth = 0.0
+                if use_w3:
+                    try:
+                        sender = use_w3.eth.account.from_key(os.getenv("PRIVATE_KEY")).address
+                        eth = use_w3.eth.get_balance(sender) / 1e18
+                    except: pass
+                msg = f"📋 SUMMARY (REAL)\nWallet: {addr}\nETH bal: {eth:.4f}\nSpent: {spent:.4f}\nValue: {val:.4f}\nOpens: {opens}\nWinrate: {wr:.1f}%"
+                return msg, spent, val
+            loop = asyncio.get_running_loop()
+            msg, spent, val = await loop.run_in_executor(None, _compute_summary)
+            _set_cached('spent', spent)
+            _set_cached('portfolio_value', val)
+            await query.message.reply_text(msg)
         except Exception as e:
-            await query.edit_message_text(f"Error: {e}")
+            await query.message.reply_text(f"Error: {e}")
 
     elif data == "cmd_positions":
         try:
+            cached = _get_cached('positions')
+            if cached:
+                await query.message.reply_text(cached)
+                return
             from b20_mainnet_sniper import get_open_positions
-            opens = get_open_positions(_current_w3)
-            if not opens:
-                msg = "📊 No open positions."
-            else:
+            def _compute_positions():
+                opens = get_open_positions(_current_w3)
+                if not opens:
+                    return "📊 No open positions."
                 msg = "📊 OPEN POSITIONS (REAL on-chain + DB):\n\n"
                 for p in opens:
                     sym = p.get('symbol', '') or ''
@@ -962,9 +1109,13 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     if p.get('note'):
                         msg += f"  ⚠️ {p['note']}\n"
                     msg += "\n"
-            await query.edit_message_text(msg[:4000])
+                return msg[:4000]
+            loop = asyncio.get_running_loop()
+            msg = await loop.run_in_executor(None, _compute_positions)
+            _set_cached('positions', msg)
+            await query.message.reply_text(msg)
         except Exception as e:
-            await query.edit_message_text(f"Positions error: {e}")
+            await query.message.reply_text(f"Positions error: {e}")
 
     elif data == "cmd_gas":
         use_w3 = _current_w3
@@ -972,11 +1123,11 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 from b20_mainnet_sniper import get_gas_info
                 g = get_gas_info(use_w3)
-                await query.edit_message_text(f"⛽ REAL Gas: {g.get('gas_price_gwei')} gwei | Base: {g.get('base_fee_gwei')} gwei")
+                await query.message.reply_text(f"⛽ REAL Gas: {g.get('gas_price_gwei')} gwei | Base: {g.get('base_fee_gwei')} gwei")
             except Exception as e:
-                await query.edit_message_text(f"Gas error: {e}")
+                await query.message.reply_text(f"Gas error: {e}")
         else:
-            await query.edit_message_text("No w3 context.")
+            await query.message.reply_text("No w3 context.")
 
     elif data == "cmd_activation":
         use_w3 = _current_w3
@@ -984,19 +1135,19 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 from b20_mainnet_sniper import get_activation_status
                 res = get_activation_status(use_w3)
-                await query.edit_message_text(f"🔓 {res} (REAL on-chain)")
+                await query.message.reply_text(f"🔓 {res} (REAL on-chain)")
             except Exception as e:
-                await query.edit_message_text(f"Error: {e}")
+                await query.message.reply_text(f"Error: {e}")
         else:
-            await query.edit_message_text("No w3.")
+            await query.message.reply_text("No w3.")
 
     elif data == "cmd_rpc":
         if _cfg:
             rpc = _cfg.get('RPC_URL', 'N/A')[:50]
             backups = len(_cfg.get('BACKUP_RPCS', []))
-            await query.edit_message_text(f"🌐 Current RPC: {rpc}...\nBackups: {backups} (real failover list)")
+            await query.message.reply_text(f"🌐 Current RPC: {rpc}...\nBackups: {backups} (real failover list)")
         else:
-            await query.edit_message_text("No config.")
+            await query.message.reply_text("No config.")
 
     elif data == "cmd_history" or data == "cmd_recent":
         # real recent
@@ -1014,9 +1165,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 for ts, tok, act, amt, txh, st, acq in rows:
                     short_tok = (tok or "")[:8] + "..."
                     msg += f"{ts[:16]} {act} {short_tok} amt={amt} acq={acq:.2f} {st}\n"
-            await query.edit_message_text(msg)
+            await query.message.reply_text(msg)
         except Exception as e:
-            await query.edit_message_text(f"History error: {e}")
+            await query.message.reply_text(f"History error: {e}")
 
     elif data == "cmd_stats":
         try:
@@ -1024,17 +1175,17 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             st = get_detailed_stats()
             wr = get_win_rate()
             msg = f"📊 STATS (REAL)\nBuys: {st['successful_buys']}\nSpent: {st['total_spent']:.4f}\nSells: {st['sells']}\nWinrate: {wr:.1f}%"
-            await query.edit_message_text(msg)
+            await query.message.reply_text(msg)
         except Exception as e:
-            await query.edit_message_text(f"Stats error: {e}")
+            await query.message.reply_text(f"Stats error: {e}")
 
     elif data == "cmd_refresh":
         try:
             from b20_mainnet_sniper import get_open_positions
             opens = get_open_positions(_current_w3)
-            await query.edit_message_text(f"🔄 Refreshed. {len(opens)} positions (real on-chain balances).")
+            await query.message.reply_text(f"🔄 Refreshed. {len(opens)} positions (real on-chain balances).")
         except Exception as e:
-            await query.edit_message_text(f"Refresh error: {e}")
+            await query.message.reply_text(f"Refresh error: {e}")
 
     elif data == "cmd_open":
         try:
@@ -1052,17 +1203,17 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             from b20_mainnet_sniper import export_trades_csv
             ok = export_trades_csv("tg_export_trades.csv")
-            await query.edit_message_text("CSV exported (real DB)." if ok else "Export failed.")
+            await query.message.reply_text("CSV exported (real DB)." if ok else "Export failed.")
         except Exception as e:
-            await query.edit_message_text(f"Error: {e}")
+            await query.message.reply_text(f"Error: {e}")
 
     elif data == "cmd_config":
         if _cfg:
             safe = {k: v for k, v in _cfg.items() if not any(x in k for x in ['KEY', 'TOKEN', 'RPC'])}
             msg = "⚙️ Config (REAL):\n" + "\n".join(f"{k}: {v}" for k, v in list(safe.items())[:10])
-            await query.edit_message_text(msg)
+            await query.message.reply_text(msg)
         else:
-            await query.edit_message_text("No config.")
+            await query.message.reply_text("No config.")
 
     elif data == "cmd_liq":
         # For liq, if there are open positions, show for first one, else prompt
@@ -1080,9 +1231,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     msg = f"No pool for {tok[:10]}. Use /liq <token>"
             else:
                 msg = "Use /liq <token> for real liquidity (on-chain pool + price)"
-            await query.edit_message_text(msg)
+            await query.message.reply_text(msg)
         except Exception as e:
-            await query.edit_message_text(f"Liq error: {e}. Use /liq <token>")
+            await query.message.reply_text(f"Liq error: {e}. Use /liq <token>")
 
     elif data == "cmd_simulate":
         try:
@@ -1098,9 +1249,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 msg = f"🧪 REAL Simulate 0.003 ETH on {tok[:10]}... -> ~{min_out / 1e18:.4f} tokens (min out)"
             else:
                 msg = "Use /simulate <token> <eth> for real Quoter output"
-            await query.edit_message_text(msg)
+            await query.message.reply_text(msg)
         except Exception as e:
-            await query.edit_message_text(f"Sim error: {e}")
+            await query.message.reply_text(f"Sim error: {e}")
 
     elif data == "cmd_safety":
         try:
@@ -1112,9 +1263,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 msg = f"🛡️ REAL Safety for {tok[:10]}... : {res}"
             else:
                 msg = "Use /safety <token> for real on-chain checks (liq, honeypot sim, etc)"
-            await query.edit_message_text(msg)
+            await query.message.reply_text(msg)
         except Exception as e:
-            await query.edit_message_text(f"Safety error: {e}")
+            await query.message.reply_text(f"Safety error: {e}")
 
     elif data == "cmd_perftoken":
         try:
@@ -1128,9 +1279,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 msg = f"📊 REAL Perftoken {p['token'][:10]}...\nHeld: {p['held']:.4f} Spent: {p['eth_spent']:.4f}\nPrice: {price:.10f}\nValue: {val:.6f} PnL: {pnl:.6f}"
             else:
                 msg = "Use /perftoken <token> for real per-token PnL"
-            await query.edit_message_text(msg)
+            await query.message.reply_text(msg)
         except Exception as e:
-            await query.edit_message_text(f"Error: {e}")
+            await query.message.reply_text(f"Error: {e}")
 
     elif data == "cmd_addblack":
         await query.edit_message_text("Use /addblack <token> to add (real blacklist update)")
@@ -1193,6 +1344,11 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             _sell_callback(use_w3, tkn, 3000, sell_amt, _cfg)
                         else:
                             print("[TG SELL BTN] computed sell_amt=0")
+                            # still notify user
+                            try:
+                                await query.message.reply_text(f"⚠️ 50% sell for {tkn[:8]}... skipped — 0 tokens held at click time.")
+                            except:
+                                pass
                     except Exception as be:
                         print(f"[TG SELL] background error: {be}")
                 threading.Thread(target=_do_sell, daemon=True).start()
@@ -1200,6 +1356,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.edit_message_text("Sell not available.")
         except Exception as e:
             await query.edit_message_text(f"Sell button error: {e}")
+
+    else:
+        # Catch-all to always give some output for any button
+        await query.message.reply_text(f"Button '{data}' clicked. No specific handler or output yet.\nTry the text command equivalent or /help.")
 
 
 async def _post_init(application: Application):
@@ -1255,6 +1415,8 @@ def _build_application(token: str) -> Application:
     app.add_handler(CommandHandler("remblack", remblack_cmd))
     app.add_handler(CommandHandler("lastbuy", lastbuy_cmd))
     app.add_handler(CommandHandler("summary", summary_cmd))
+    app.add_handler(CommandHandler("profit", profit_cmd))
+    app.add_handler(CommandHandler("checkprofit", profit_cmd))
 
     # Inline buttons
     app.add_handler(CallbackQueryHandler(button_callback))
