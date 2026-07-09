@@ -1735,8 +1735,12 @@ def main():
                     tg_send(msg, reply_markup=buttons)
                     if not dry_run:
                         attempt_buy(w3, tx.get('to', ''), 3000, 0.001, cfg)
+                ws_url = os.getenv("WEBSOCKET_RPC") or os.getenv("WS_RPC") or cfg.get("RPC_URL", "wss://base-mainnet.public.blastapi.io").replace("https://", "wss://")
+                if "mainnet.base.org" in ws_url:
+                    ws_url = "wss://base.publicnode.com"
+                
                 mempool = MempoolMonitor(
-                    ws_rpc_url=cfg.get("RPC_URL", "wss://base-mainnet.public.blastapi.io").replace("https://", "wss://"),
+                    ws_rpc_url=ws_url,
                     on_b20_detected=on_b20_mem,
                     on_pool_detected=lambda tx, txh, st: None
                 )
