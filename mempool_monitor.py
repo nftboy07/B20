@@ -128,14 +128,35 @@ class MempoolMonitor:
         self.stats["b20_detections"] += 1
         self.stats["last_detection"] = datetime.utcnow()
 
-        # Decode params (simplified - full ABI decode would be better)
         input_data = tx.get("input", "0x")
-        # For demo, just note it
+        # Decode to get name if possible (simplified)
+        name = "B20 Token"
+        try:
+            # Skip selector (4 bytes), decode the tuple
+            # params is the 3rd arg, offset etc.
+            # For simplicity, try to find strings in input
+            data = bytes.fromhex(input_data[2:] if input_data.startswith('0x') else input_data)
+            # Rough: look for string lengths
+            # Better decode using eth_abi
+            from eth_abi import decode
+            # The input after 4 bytes is encoded (uint8, bytes32, bytes, bytes[])
+            # Decode first 3
+            decoded = decode(['uint8', 'bytes32', 'bytes'], data[4:4+32+32+32+32])  # rough
+            params = decoded[2]
+            # params starts with version byte + strings
+            if len(params) > 1:
+                # skip version, decode strings
+                name_len = int.from_bytes(params[1:33], 'big') if len(params) > 33 else 0
+                if name_len > 0 and name_len < 100:
+                    name = params[33:33+name_len].decode('utf-8', errors='ignore')
+        except:
+            pass
+
         logger.info(f"B20 creation detected in mempool: {tx_hash}")
-        print(f"🚀 MEMPOOL B20 DETECTED: {tx_hash} from {tx.get('from')}")
+        print(f"🚀 MEMPOOL B20 DETECTED: {name} {tx_hash} from {tx.get('from')}")
 
         if self.on_b20_detected:
-            await self.on_b20_detected(tx, tx_hash, "b20_creation")
+            await self.on_b20_detected(tx, tx_hash, "b20_creation", name)
 
         # Record for stats
         self._record_detection(tx_hash, "b20", tx.get("gasPrice", 0))

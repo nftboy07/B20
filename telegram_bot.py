@@ -114,6 +114,22 @@ async def kill_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         open(kf, "a").close()
     await update.message.reply_text("🛑 Kill switch activated.")
 
+# Upgrade TG (76-85): more commands
+async def sell_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args or []
+    if len(args) < 1:
+        await update.message.reply_text("Usage: /sell <token> [percent|all]  (e.g. /sell 0x... 50)")
+        return
+    token = args[0]
+    pct = 100 if len(args) < 2 or args[1].lower() == "all" else float(args[1])
+    await update.message.reply_text(f"🔔 Sell request for {pct}% of {token} received. (Auto-sell logic in main bot - implement full in future upgrade)")
+    # TODO: call actual sell via callback if wired
+
+async def positions_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Upgrade #77: status with positions/PnL stub
+    msg = "📊 Positions: (stub - integrate DB trades + on-chain for real PnL)\nNo open positions tracked yet.\nUse /status for basic."
+    await update.message.reply_text(msg)
+
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -181,6 +197,8 @@ def _build_application(token: str) -> Application:
     app.add_handler(CommandHandler("pause", pause_cmd))
     app.add_handler(CommandHandler("resume", resume_cmd))
     app.add_handler(CommandHandler("kill", kill_cmd))
+    app.add_handler(CommandHandler("sell", sell_cmd))
+    app.add_handler(CommandHandler("positions", positions_cmd))
 
     # Inline buttons
     app.add_handler(CallbackQueryHandler(button_callback))
