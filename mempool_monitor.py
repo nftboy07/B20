@@ -61,15 +61,17 @@ class MempoolMonitor:
         "wss://mainnet.base.org/ws",
     ]
 
-    def __init__(self, rpc_url: str = None, db_manager=None):
+    def __init__(self, rpc_url: str = None, db_manager=None, ws_rpc_url: str = None, on_b20_detected: Optional[Callable] = None, on_pool_detected: Optional[Callable] = None):
         """Initialize mempool monitor.
         
         Args:
             rpc_url: WebSocket RPC URL (if None, uses public endpoints)
             db_manager: Database manager for logging events
         """
-        self.ws_rpc = rpc_url or self.WEBSOCKET_URLS[0]
+        self.ws_rpc = rpc_url or ws_rpc_url or self.WEBSOCKET_URLS[0]
         self.db_manager = db_manager
+        self.on_b20_detected = on_b20_detected
+        self.on_pool_detected = on_pool_detected
         self.w3 = None
         self.pending_txs: Set[str] = set()
         self.is_running = False
@@ -181,6 +183,22 @@ class MempoolMonitor:
         logger.info(f"   Gas Price: {tx.get('gasPrice') / 1e9:.2f} gwei")
         logger.info(f"   Function: {func_sig}")
         
+        # Trigger legacy callback
+        if self.on_b20_detected:
+            try:
+                compat_tx = {
+                    'to': self.B20_FACTORY,
+                    'from': tx.get('from'),
+                    'input': data,
+                    'gasPrice': tx.get('gasPrice')
+                }
+                if asyncio.iscoroutinefunction(self.on_b20_detected):
+                    await self.on_b20_detected(compat_tx, tx_hash, 'pending')
+                else:
+                    self.on_b20_detected(compat_tx, tx_hash, 'pending')
+            except Exception as e:
+                logger.error(f"Legacy B20 callback error: {e}")
+                
         # Trigger callbacks
         for callback in self.callbacks:
             try:
@@ -215,6 +233,22 @@ class MempoolMonitor:
                 logger.info(f"   Fee Tier: {fee}")
                 logger.info(f"   Gas Price: {tx.get('gasPrice') / 1e9:.2f} gwei")
                 
+                # Trigger legacy callback
+                if self.on_pool_detected:
+                    try:
+                        compat_tx = {
+                            'to': self.UNISWAP_V3_FACTORY,
+                            'from': tx.get('from'),
+                            'input': data,
+                            'gasPrice': tx.get('gasPrice')
+                        }
+                        if asyncio.iscoroutinefunction(self.on_pool_detected):
+                            await self.on_pool_detected(compat_tx, tx_hash, 'pending')
+                        else:
+                            self.on_pool_detected(compat_tx, tx_hash, 'pending')
+                    except Exception as e:
+                        logger.error(f"Legacy pool callback error: {e}")
+                        
                 # Trigger callbacks
                 for callback in self.callbacks:
                     try:
