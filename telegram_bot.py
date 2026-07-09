@@ -1399,11 +1399,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             _sell_callback(use_w3, tkn, 3000, sell_amt, _cfg)
                         else:
                             print("[TG SELL BTN] computed sell_amt=0")
-                            # still notify user
-                            try:
-                                await query.message.reply_text(f"⚠️ 50% sell for {tkn[:8]}... skipped — 0 tokens held at click time.")
-                            except:
-                                pass
                     except Exception as be:
                         print(f"[TG SELL] background error: {be}")
                 threading.Thread(target=_do_sell, daemon=True).start()
