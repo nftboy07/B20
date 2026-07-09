@@ -97,11 +97,11 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _send_control_panel(update, context)
     await update.message.reply_text(
         "More commands (real mainnet):\n"
-        "/status /positions /pnl /spent /value /open /perftoken <tok>\n"
-        "/ethbalance /balance <tok> /price <tok> /token <tok>\n"
-        "/pools <tok> /safety <tok> /gas /config /stats /recent\n"
-        "/history /tx <hash> /buy <tok> <amt> /sell <tok> <pct>\n"
-        "/blacklistlist /export /activation /rpc /refresh\n"
+        "/status /positions /pnl /spent /value /open /perftoken <tok> /summary\n"
+        "/ethbalance /balance <tok> /price <tok> /token <tok> /liq <tok>\n"
+        "/pools <tok> /safety <tok> /gas /config /stats /recent /lastbuy\n"
+        "/simulate <tok> <eth> /history /tx <hash> /buy <tok> <amt> /sell <tok> <pct>\n"
+        "/blacklistlist /addblack /remblack /export /activation /rpc /refresh\n"
         "Buttons on detections + after buys. Use /tx to verify transfers."
     )
 
@@ -693,6 +693,127 @@ async def refresh_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Refresh error: {e}")
 
 
+async def liq_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Liquidity for a token (real mainnet)."""
+    args = context.args or []
+    if not args:
+        await update.message.reply_text("Usage: /liq <token>")
+        return
+    token = args[0]
+    use_w3 = _current_w3
+    if not use_w3:
+        await update.message.reply_text("No w3 context.")
+        return
+    try:
+        from b20_mainnet_sniper import find_best_pool, check_pool_liquidity, get_token_price_in_eth
+        pool, fee = find_best_pool(use_w3, token)
+        if pool:
+            liq = check_pool_liquidity(use_w3, pool)
+            price = get_token_price_in_eth(use_w3, token)
+            await update.message.reply_text(f"💧 Liq for {token[:8]}... : {liq/1e18:.4f} ETH (fee {fee}) price~{price:.10f}")
+        else:
+            await update.message.reply_text("No pool found.")
+    except Exception as e:
+        await update.message.reply_text(f"Liq error: {e}")
+
+
+async def simulate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Simulate buy output (Quoter, real mainnet, no tx)."""
+    args = context.args or []
+    if len(args) < 2:
+        await update.message.reply_text("Usage: /simulate <token> <eth>")
+        return
+    token, amt = args[0], float(args[1])
+    use_w3 = _current_w3
+    if not use_w3:
+        await update.message.reply_text("No w3.")
+        return
+    try:
+        from b20_mainnet_sniper import get_accurate_min_out, find_best_pool
+        pool, fee = find_best_pool(use_w3, token)
+        if not fee: fee = 3000
+        amount_in = use_w3.to_wei(amt, 'ether')
+        min_out = get_accurate_min_out(use_w3, token, fee, amount_in, 2000)
+        dec = 18  # assume
+        try:
+            from b20_mainnet_sniper import get_token_decimals
+            dec = get_token_decimals(use_w3, token)
+        except:
+            pass
+        await update.message.reply_text(f"🧪 Simulate {amt} ETH -> ~{min_out / (10**dec):.4f} tokens (min, fee {fee})")
+    except Exception as e:
+        await update.message.reply_text(f"Sim error: {e}")
+
+
+async def addblack_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Add token to blacklist."""
+    args = context.args or []
+    if not args:
+        await update.message.reply_text("Usage: /addblack <token>")
+        return
+    token = args[0]
+    try:
+        from b20_mainnet_sniper import BLACKLIST
+        BLACKLIST.add(token.lower())
+        await update.message.reply_text(f"🖤 Added {token[:8]}... to blacklist.")
+    except Exception as e:
+        await update.message.reply_text(f"Error: {e}")
+
+
+async def remblack_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Remove from blacklist."""
+    args = context.args or []
+    if not args:
+        await update.message.reply_text("Usage: /remblack <token>")
+        return
+    token = args[0]
+    try:
+        from b20_mainnet_sniper import BLACKLIST
+        BLACKLIST.discard(token.lower())
+        await update.message.reply_text(f"Removed {token[:8]}... from blacklist.")
+    except Exception as e:
+        await update.message.reply_text(f"Error: {e}")
+
+
+async def lastbuy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Details of last buy."""
+    try:
+        import sqlite3
+        conn = sqlite3.connect("b20_trades.db")
+        c = conn.cursor()
+        c.execute("SELECT timestamp, token, amount, tx_hash, status, COALESCE(token_amount,0) FROM trades WHERE action='buy' ORDER BY id DESC LIMIT 1")
+        row = c.fetchone()
+        conn.close()
+        if not row:
+            await update.message.reply_text("No buys yet.")
+            return
+        ts, tok, amt, txh, st, acq = row
+        await update.message.reply_text(f"🛒 Last buy: {ts}\nToken: {tok}\nSpent: {amt} ETH\nAcquired: {acq}\nStatus: {st}\nTx: {txh}\nBasescan: https://basescan.org/tx/{txh}")
+    except Exception as e:
+        await update.message.reply_text(f"Error: {e}")
+
+
+async def summary_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Quick summary of bot state."""
+    use_w3 = _current_w3
+    try:
+        from b20_mainnet_sniper import get_total_spent, get_estimated_portfolio_value, get_open_positions, get_win_rate, get_bot_address
+        spent = get_total_spent()
+        val = get_estimated_portfolio_value(use_w3)
+        opens = len(get_open_positions(use_w3))
+        wr = get_win_rate()
+        addr = get_bot_address()
+        eth = 0
+        if use_w3:
+            try:
+                sender = use_w3.eth.account.from_key(os.getenv("PRIVATE_KEY")).address
+                eth = use_w3.eth.get_balance(sender) / 1e18
+            except: pass
+        await update.message.reply_text(f"📋 SUMMARY\nWallet: {addr}\nETH bal: {eth:.4f}\nSpent: {spent:.4f}\nValue: {val:.4f}\nOpens: {opens}\nWinrate: {wr:.1f}%")
+    except Exception as e:
+        await update.message.reply_text(f"Error: {e}")
+
+
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -818,6 +939,12 @@ def _build_application(token: str) -> Application:
     app.add_handler(CommandHandler("rpc", rpc_cmd))
     app.add_handler(CommandHandler("perftoken", perftoken_cmd))
     app.add_handler(CommandHandler("refresh", refresh_cmd))
+    app.add_handler(CommandHandler("liq", liq_cmd))
+    app.add_handler(CommandHandler("simulate", simulate_cmd))
+    app.add_handler(CommandHandler("addblack", addblack_cmd))
+    app.add_handler(CommandHandler("remblack", remblack_cmd))
+    app.add_handler(CommandHandler("lastbuy", lastbuy_cmd))
+    app.add_handler(CommandHandler("summary", summary_cmd))
 
     # Inline buttons
     app.add_handler(CallbackQueryHandler(button_callback))
