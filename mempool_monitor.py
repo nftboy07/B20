@@ -16,9 +16,12 @@ from dataclasses import dataclass
 
 from web3 import Web3
 try:
-    from web3.providers import WebsocketProvider
+    from web3.providers import LegacyWebSocketProvider as WebsocketProvider
 except ImportError:
-    from web3.providers import WebSocketProvider as WebsocketProvider
+    try:
+        from web3.providers import WebsocketProvider
+    except ImportError:
+        from web3.providers import WebSocketProvider as WebsocketProvider
 from eth_utils import to_checksum_address
 from eth_abi import decode
 

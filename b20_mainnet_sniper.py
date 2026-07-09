@@ -369,9 +369,13 @@ def get_safe_config(cfg: dict) -> dict:
 def get_w3(rpc_url: str) -> Web3:
     if rpc_url.startswith("wss://"):
         try:
-            w3 = Web3(Web3.WebsocketProvider(rpc_url))
-        except:
-            w3 = Web3(Web3.WebSocketProvider(rpc_url))
+            from web3.providers import LegacyWebSocketProvider
+            w3 = Web3(LegacyWebSocketProvider(rpc_url))
+        except ImportError:
+            try:
+                w3 = Web3(Web3.WebsocketProvider(rpc_url))
+            except:
+                w3 = Web3(Web3.WebSocketProvider(rpc_url))
     else:
         w3 = Web3(Web3.HTTPProvider(rpc_url))
     return w3
