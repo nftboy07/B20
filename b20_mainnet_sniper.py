@@ -442,16 +442,21 @@ def init_db():
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS trades
-                 (id INTEGER PRIMARY KEY, timestamp TEXT, token TEXT, action TEXT, amount REAL, tx_hash TEXT, status TEXT)''')
+                 (id INTEGER PRIMARY KEY, timestamp TEXT, token TEXT, action TEXT, amount REAL, tx_hash TEXT, status TEXT, token_amount REAL DEFAULT 0)''')
+    # Add column if old DB
+    try:
+        c.execute("ALTER TABLE trades ADD COLUMN token_amount REAL DEFAULT 0")
+    except:
+        pass
     conn.commit()
     conn.close()
 
-def log_trade(token: str, action: str, amount: float, tx_hash: str = "", status: str = "pending"):
+def log_trade(token: str, action: str, amount: float, tx_hash: str = "", status: str = "pending", token_amount: float = 0.0):
     try:
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
-        c.execute("INSERT INTO trades (timestamp, token, action, amount, tx_hash, status) VALUES (?, ?, ?, ?, ?, ?)",
-                  (datetime.utcnow().isoformat(), token, action, amount, tx_hash, status))
+        c.execute("INSERT INTO trades (timestamp, token, action, amount, tx_hash, status, token_amount) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                  (datetime.utcnow().isoformat(), token, action, amount, tx_hash, status, token_amount or 0))
         conn.commit()
         conn.close()
     except Exception as e:
@@ -554,7 +559,8 @@ def get_open_positions(w3=None) -> list:
         c = conn.cursor()
         c.execute("""
             SELECT token, 
-                   SUM(CASE WHEN action='buy' THEN amount ELSE 0 END) as eth_spent
+                   SUM(CASE WHEN action='buy' THEN amount ELSE 0 END) as eth_spent,
+                   SUM(CASE WHEN action='buy' THEN COALESCE(token_amount, 0) ELSE 0 END) as tokens_acquired
             FROM trades 
             WHERE status='success'
             GROUP BY token
@@ -569,12 +575,16 @@ def get_open_positions(w3=None) -> list:
                 sender = w3.eth.account.from_key(os.getenv("PRIVATE_KEY")).address
             except:
                 sender = None
-        for token, eth_spent in rows:
+        for token, eth_spent, tokens_acquired in rows:
             held_human = 0.0
             price = 0.0
             value = 0.0
             pnl = 0.0
             pnl_pct = 0.0
+            acquired = tokens_acquired or 0.0
+            entry_price = 0.0
+            if acquired > 0:
+                entry_price = (eth_spent or 0) / acquired
             suggestion = "Sell 70% now (recoup + profit), moon bag 30% for moon"
             if w3 and sender:
                 try:
@@ -605,16 +615,22 @@ def get_open_positions(w3=None) -> list:
                     sym = erc_sym.functions.symbol().call()
             except:
                 pass
+            note = ""
+            if acquired == 0 and eth_spent > 0:
+                note = "0 tokens received from swap (tax/liq/redirect?)"
             positions.append({
                 'token': token,
                 'symbol': sym,
                 'eth_spent': eth_spent or 0,
                 'held': held_human,
+                'acquired': acquired,
+                'entry_price_eth': entry_price,
                 'price_eth': price,
                 'value_eth': value,
                 'pnl_eth': pnl,
                 'pnl_pct': pnl_pct,
-                'suggestion': suggestion
+                'suggestion': suggestion,
+                'note': note
             })
         return positions
     except Exception as e:
@@ -676,6 +692,55 @@ def export_trades_csv(filename: str = "trades_export.csv") -> bool:
     except Exception as e:
         print(f"CSV export failed: {e}")
         return False
+
+
+def get_total_spent() -> float:
+    """Total ETH spent on successful buys from DB."""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT SUM(amount) FROM trades WHERE action='buy' AND status='success'")
+        row = c.fetchone()
+        conn.close()
+        return float(row[0] or 0)
+    except:
+        return 0.0
+
+
+def get_estimated_portfolio_value(w3=None) -> float:
+    """Rough current value of open positions using live prices."""
+    try:
+        opens = get_open_positions(w3)
+        total = 0.0
+        for p in opens:
+            total += p.get('value_eth', 0) or 0
+        return total
+    except:
+        return 0.0
+
+
+def get_gas_info(w3: Web3) -> dict:
+    """Real mainnet gas info."""
+    try:
+        gas_price = w3.eth.gas_price / 1e9
+        history = w3.eth.fee_history(1, 'latest', [50])
+        base = history.get('baseFeePerGas', [0])[-1] / 1e9 if history.get('baseFeePerGas') else gas_price
+        return {
+            'gas_price_gwei': round(gas_price, 2),
+            'base_fee_gwei': round(base, 2),
+            'priority_gwei': 2.0  # typical
+        }
+    except:
+        return {'gas_price_gwei': 0, 'base_fee_gwei': 0}
+
+
+def run_token_safety(w3: Web3, token: str) -> str:
+    """Run available safety checks and return summary string."""
+    try:
+        safe, reason = check_token_safety(w3, token, 0.1)  # low min for check
+        return f"Safety: {'PASS' if safe else 'FAIL'} - {reason}"
+    except Exception as e:
+        return f"Safety check error: {str(e)[:80]}"
 
 def check_token_safety(w3: Web3, token: str, min_liq: float) -> tuple[bool, str]:
     """Enhanced safety checks to avoid honeypots, rugs, etc. Returns (is_safe, reason)"""
@@ -1172,11 +1237,47 @@ def attempt_buy(w3: Web3, token: str, fee: int, amount_eth: float, cfg: dict,
                 receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=90)
                 if receipt.status == 1:
                     print("BUY SUCCESS:", tx_hash.hex())
-                    log_trade(token, "buy", amount_eth, tx_hash.hex(), "success")
-                    tg_send(f"✅ <b>BUY SUCCESS</b> for {token}\nTx: <code>{tx_hash.hex()}</code>")
+                    # Better: parse actual transferred amount from the tx logs (Transfer event to our wallet)
+                    # This captures what the swap/pool actually delivered, even if token has tax/burn
+                    received_tokens = 0.0
+                    try:
+                        transfer_topic = keccak(text="Transfer(address,address,uint256)").hex()
+                        for log in receipt.get("logs", []):
+                            if (log.get("address", "").lower() == token.lower() and
+                                len(log.get("topics", [])) >= 3):
+                                topic0 = log["topics"][0].hex() if hasattr(log["topics"][0], "hex") else log["topics"][0]
+                                if topic0.lower().endswith(transfer_topic.lower()):
+                                    # topics[2] is the 'to' address (padded)
+                                    to_padded = log["topics"][2].hex() if hasattr(log["topics"][2], "hex") else str(log["topics"][2])
+                                    to_addr = "0x" + to_padded[-40:]
+                                    if to_addr.lower() == sender.lower():
+                                        data = log.get("data", b"")
+                                        if isinstance(data, str):
+                                            data = bytes.fromhex(data[2:] if data.startswith("0x") else data)
+                                        amount = int.from_bytes(data, "big")
+                                        dec = get_token_decimals(w3, token)
+                                        received_tokens = amount / (10 ** dec) if amount else 0.0
+                                        break
+                        if received_tokens == 0:
+                            # Fallback to balance query (in case logs parsing missed it)
+                            erc = w3.eth.contract(address=to_checksum_address(token), abi=ERC20_MIN_ABI)
+                            dec = get_token_decimals(w3, token)
+                            bal = erc.functions.balanceOf(sender).call()
+                            received_tokens = bal / (10 ** dec) if bal else 0.0
+                    except Exception as be:
+                        print(f"Could not parse received tokens from logs: {be}")
+                        try:
+                            erc = w3.eth.contract(address=to_checksum_address(token), abi=ERC20_MIN_ABI)
+                            dec = get_token_decimals(w3, token)
+                            bal = erc.functions.balanceOf(sender).call()
+                            received_tokens = bal / (10 ** dec) if bal else 0.0
+                        except:
+                            pass
+                    log_trade(token, "buy", amount_eth, tx_hash.hex(), "success", token_amount=received_tokens)
+                    tg_send(f"✅ <b>BUY SUCCESS</b> for {token}\nTx: <code>{tx_hash.hex()}</code>\nReceived ~{received_tokens:.6f} tokens (for {amount_eth} ETH)")
                     export_trades_csv()  # analytics #87
                     # Upgrade #63-64: basic TP ladder with sell buttons
-                    print(f"[TP LADDER] For {token}: consider sell 25% at 2x, 25% at 5x, 50% at 10x. Current entry {amount_eth} ETH")
+                    print(f"[TP LADDER] For {token}: consider sell 25% at 2x, 25% at 5x, 50% at 10x. Current entry {amount_eth} ETH. Received: {received_tokens}")
                     sell_buttons = {
                         "inline_keyboard": [
                             [{"text": "Sell 25%", "callback_data": f"sell_{token}_25"},
