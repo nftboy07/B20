@@ -95,15 +95,45 @@ async def _send_control_panel(update_or_chat, context: ContextTypes.DEFAULT_TYPE
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _send_control_panel(update, context)
-    await update.message.reply_text(
-        "More commands (real mainnet):\n"
-        "/status /positions /pnl /spent /value /open /perftoken <tok> /summary\n"
-        "/ethbalance /balance <tok> /price <tok> /token <tok> /liq <tok>\n"
-        "/pools <tok> /safety <tok> /gas /config /stats /recent /lastbuy\n"
-        "/simulate <tok> <eth> /history /tx <hash> /buy <tok> <amt> /sell <tok> <pct>\n"
-        "/blacklistlist /addblack /remblack /export /activation /rpc /refresh\n"
-        "Buttons on detections + after buys. Use /tx to verify transfers."
-    )
+    await help_cmd(update, context)
+
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comprehensive command list."""
+    help_text = """📋 B20 Sniper - All Commands (real mainnet)
+
+**Control**
+/status /pause /resume /kill /refresh
+
+**Trading**
+/buy <token> <eth>    /sell <token> [25|50|100|all]
+/positions
+
+**Balances & Info (live on-chain)**
+/balance <token>   /ethbalance /wallet
+/price <token>     /token <token>
+/liq <token>       /pools <token>
+/gas               /simulate <token> <eth>
+/safety <token>    /perftoken <token>
+/activation        /rpc
+
+**Analytics & History**
+/pnl /spent /value /summary /stats
+/history /recent [n] /lastbuy /open
+/tx <hash>         /export /csv
+
+**Management**
+/blacklist <token>   /blacklistlist
+/addblack <token>    /remblack <token>
+/config
+
+**Help**
+/help /list /commands /menu
+
+Buttons appear on new detections + after buys.
+Use /tx to inspect any transaction on Basescan."""
+
+    await update.message.reply_text(help_text)
 
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -921,8 +951,9 @@ def _build_application(token: str) -> Application:
     app.add_handler(CommandHandler("pools", pools_cmd))
     app.add_handler(CommandHandler("tx", tx_cmd))
     app.add_handler(CommandHandler("tokeninfo", token_cmd))
-    app.add_handler(CommandHandler("help", start_cmd))
-    app.add_handler(CommandHandler("commands", start_cmd))
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("list", help_cmd))
+    app.add_handler(CommandHandler("commands", help_cmd))
     app.add_handler(CommandHandler("export", export_cmd))
     app.add_handler(CommandHandler("csv", export_cmd))
     app.add_handler(CommandHandler("pnl", pnl_cmd))
