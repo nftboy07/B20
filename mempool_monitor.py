@@ -196,23 +196,59 @@ class MempoolMonitor:
         except Exception as e:
             logger.debug(f"Error processing tx {tx_hash[:8]}: {e}")
 
+    def predict_token_address(self, data_hex: str) -> Optional[str]:
+        """Predict the address of the B20 token being created in this transaction."""
+        try:
+            if len(data_hex) < 10 or not data_hex.startswith("0x62975e6a"):  # createB20 selector
+                return None
+            body = bytes.fromhex(data_hex[10:])
+            # Decode: createB20(uint8 variant, bytes32 salt, bytes params, bytes[] initCalls)
+            decoded = decode(['uint8', 'bytes32', 'bytes', 'bytes[]'], body)
+            variant, salt, params, init_calls = decoded
+            
+            # Call getB20Address on B20 Factory if available
+            factory = self.w3.eth.contract(address=self.B20_FACTORY, abi=[
+                {
+                    "inputs": [
+                        {"name": "variant", "type": "uint8"},
+                        {"name": "salt", "type": "bytes32"},
+                        {"name": "params", "type": "bytes"},
+                        {"name": "initCalls", "type": "bytes[]"}
+                    ],
+                    "name": "getB20Address",
+                    "outputs": [{"type": "address"}],
+                    "stateMutability": "view",
+                    "type": "function"
+                }
+            ])
+            
+            predicted = factory.functions.getB20Address(variant, salt, params, init_calls).call()
+            return to_checksum_address(predicted)
+        except Exception as e:
+            logger.debug(f"Failed to predict token address: {e}")
+            return None
+
     async def _handle_b20_tx(self, tx_hash: str, tx: Dict, data: str, func_sig: str):
         """Handle B20 factory transaction."""
         self.stats['b20_txs'] += 1
         
         logger.info(f"🆕 Detected B20 transaction: {tx_hash[:8]}...")
         logger.info(f"   From: {tx.get('from')[:8]}...")
-        logger.info(f"   Gas Price: {tx.get('gasPrice') / 1e9:.2f} gwei")
+        logger.info(f"   Gas Price: {tx.get('gasPrice', 0) / 1e9:.2f} gwei")
         logger.info(f"   Function: {func_sig}")
         
+        predicted_token = self.predict_token_address(data)
+        if predicted_token:
+            logger.info(f"🔮 Predicted B20 Token Address: {predicted_token}")
+            
         # Trigger legacy callback
         if self.on_b20_detected:
             try:
                 compat_tx = {
-                    'to': self.B20_FACTORY,
+                    'to': predicted_token or self.B20_FACTORY,
                     'from': tx.get('from'),
                     'input': data,
-                    'gasPrice': tx.get('gasPrice')
+                    'gasPrice': tx.get('gasPrice', 0)
                 }
                 if asyncio.iscoroutinefunction(self.on_b20_detected):
                     await self.on_b20_detected(compat_tx, tx_hash, 'pending')
@@ -228,7 +264,8 @@ class MempoolMonitor:
                     'tx_hash': tx_hash,
                     'from': tx.get('from'),
                     'data': data,
-                    'gas_price': tx.get('gasPrice'),
+                    'gas_price': tx.get('gasPrice', 0),
+                    'predicted_token': predicted_token,
                     'timestamp': datetime.now(timezone.utc).isoformat(),
                 })
             except Exception as e:

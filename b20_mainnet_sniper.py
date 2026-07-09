@@ -326,6 +326,160 @@ def is_activation_time_passed() -> bool:
 
 mempool_monitor_instance = None
 
+accounts_list = []
+
+def init_accounts(w3: Web3):
+    global accounts_list
+    accounts_list = []
+    pks_str = os.getenv("PRIVATE_KEYS") or os.getenv("PRIVATE_KEY", "")
+    if pks_str:
+        pks = [k.strip() for k in pks_str.split(",") if k.strip()]
+        for pk in pks:
+            try:
+                acc = w3.eth.account.from_key(pk)
+                accounts_list.append((pk, acc))
+                print(f"[ROTATION] Loaded wallet: {acc.address}")
+            except Exception as e:
+                print(f"[ROTATION] Failed to load key: {e}")
+    if not accounts_list:
+        print("[ROTATION] WARNING: No private keys loaded! Bot will not be able to trade.")
+
+def get_next_rotation_account(w3: Web3) -> tuple[str, Any]:
+    global accounts_list
+    if not accounts_list:
+        pk = os.getenv("PRIVATE_KEY")
+        if pk:
+            acc = w3.eth.account.from_key(pk)
+            return pk, acc
+        raise ValueError("No private keys configured!")
+        
+    best_pk, best_acc = accounts_list[0]
+    best_bal = -1
+    for pk, acc in accounts_list:
+        try:
+            bal = w3.eth.get_balance(acc.address)
+            if bal > best_bal:
+                best_bal = bal
+                best_pk, best_acc = pk, acc
+        except Exception as e:
+            print(f"[ROTATION] Balance query error for {acc.address}: {e}")
+            
+    print(f"[ROTATION] Selected wallet {best_acc.address} with balance {best_bal/1e18:.4f} ETH")
+    return best_pk, best_acc
+
+def load_active_positions_from_db() -> Dict[str, Dict]:
+    positions = {}
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT token, amount, token_amount, timestamp FROM trades WHERE action='buy' AND status='success'")
+        buys = c.fetchall()
+        c.execute("SELECT token, token_amount FROM trades WHERE action='sell' AND status='success'")
+        sells = c.fetchall()
+        conn.close()
+        
+        token_balances = {}
+        for token, amount, token_amount, timestamp in buys:
+            if token not in token_balances:
+                dt = datetime.fromisoformat(timestamp)
+                token_balances[token] = {
+                    'total_spent_eth': amount,
+                    'token_amount': token_amount,
+                    'timestamp': dt.replace(tzinfo=timezone.utc).timestamp()
+                }
+            else:
+                token_balances[token]['total_spent_eth'] += amount
+                token_balances[token]['token_amount'] += token_amount
+                
+        for token, token_amount in sells:
+            if token in token_balances:
+                token_balances[token]['token_amount'] -= token_amount
+                
+        for token, data in token_balances.items():
+            if data['token_amount'] > 0.001:
+                positions[token] = {
+                    'buy_price_eth': data['total_spent_eth'] / data['token_amount'] if data['token_amount'] > 0 else 0,
+                    'token_amount': data['token_amount'],
+                    'timestamp': data['timestamp'],
+                    'highest_price_eth': data['total_spent_eth'] / data['token_amount'] if data['token_amount'] > 0 else 0,
+                }
+    except Exception as e:
+        print(f"[DB] load active positions error: {e}")
+    return positions
+
+async def monitor_positions_loop(w3: Web3, cfg: dict):
+    print("[MONITOR] Starting active position monitoring loop...")
+    while True:
+        try:
+            for token, pos in list(ACTIVE_POSITIONS.items()):
+                current_price = get_token_price_in_eth(w3, token)
+                if current_price <= 0:
+                    continue
+                
+                entry_price = pos['buy_price_eth']
+                token_amount = pos['token_amount']
+                buy_time = pos['timestamp']
+                highest_price = pos.get('highest_price_eth', entry_price)
+                
+                if current_price > highest_price:
+                    pos['highest_price_eth'] = current_price
+                    highest_price = current_price
+                
+                pnl_pct = ((current_price - entry_price) / entry_price) * 100 if entry_price > 0 else 0
+                tsl_pct = ((highest_price - current_price) / highest_price) * 100 if highest_price > 0 else 0
+                age_minutes = (time.time() - buy_time) / 60
+                
+                tp_pct = cfg.get("TAKE_PROFIT_PCT", 100.0)
+                sl_pct = cfg.get("STOP_LOSS_PCT", 20.0)
+                tsl_limit_pct = cfg.get("TRAILING_STOP_LOSS_PCT", 15.0)
+                max_hold_minutes = cfg.get("MAX_HOLD_MINUTES", 15.0)
+                
+                trigger_sell = False
+                reason = ""
+                
+                if pnl_pct >= tp_pct:
+                    trigger_sell = True
+                    reason = f"Take Profit (+{pnl_pct:.1f}%)"
+                elif pnl_pct <= -sl_pct:
+                    trigger_sell = True
+                    reason = f"Stop Loss ({pnl_pct:.1f}%)"
+                elif tsl_pct >= tsl_limit_pct and pnl_pct > 0:
+                    trigger_sell = True
+                    reason = f"Trailing Stop Loss (-{tsl_pct:.1f}% from ATH, PnL +{pnl_pct:.1f}%)"
+                elif age_minutes >= max_hold_minutes:
+                    trigger_sell = True
+                    reason = f"Time Limit Reached ({age_minutes:.1f} minutes hold)"
+                
+                if trigger_sell:
+                    print(f"[MONITOR] Exiting position for {token}. Reason: {reason}")
+                    tg_send(f"🚨 <b>Automated Exit Triggered</b> for {token}\nReason: {reason}\nAmount: {token_amount:.6f}")
+                    pool, actual_fee = find_best_pool(w3, token)
+                    fee = actual_fee or 3000
+                    decimals = get_token_decimals(w3, token)
+                    amount_wei = int(token_amount * (10 ** decimals))
+                    
+                    tx_hash = attempt_sell(w3, token, fee, amount_wei, cfg)
+                    if tx_hash:
+                        ACTIVE_POSITIONS.pop(token, None)
+                    else:
+                        print(f"[MONITOR] Failed to sell position for {token}")
+                        
+            await asyncio.sleep(10)
+        except Exception as e:
+            print(f"[MONITOR] Position loop error: {e}")
+            await asyncio.sleep(10)
+
+recent_buys = []
+
+def check_rate_limit(max_per_minute: int = 2) -> bool:
+    """Check if the rate limit for buys is exceeded. Enforces safety throttling."""
+    global recent_buys
+    now = time.time()
+    recent_buys = [t for t in recent_buys if now - t < 60]
+    if len(recent_buys) >= max_per_minute:
+        return False
+    return True
+
 def load_config() -> Dict[str, Any]:
     load_dotenv()
     cfg = {
@@ -570,8 +724,11 @@ def get_token_price_in_eth(w3, token):
         return 0.0
 
 def get_bot_address() -> str:
-    """Return the address the bot is using (from PRIVATE_KEY in .env)."""
+    """Return the address the bot is using."""
     try:
+        global accounts_list
+        if accounts_list:
+            return ", ".join(acc.address for _, acc in accounts_list)
         pk = os.getenv("PRIVATE_KEY")
         if pk:
             from eth_account import Account
@@ -630,12 +787,16 @@ def get_open_positions(w3=None, include_price=True) -> list:
         rows = c.fetchall()
         conn.close()
         positions = []
-        sender = None
+        senders = []
         if w3:
-            try:
-                sender = w3.eth.account.from_key(os.getenv("PRIVATE_KEY")).address
-            except:
-                sender = None
+            global accounts_list
+            if accounts_list:
+                senders = [acc.address for _, acc in accounts_list]
+            else:
+                try:
+                    senders = [w3.eth.account.from_key(os.getenv("PRIVATE_KEY")).address]
+                except:
+                    pass
         for token, eth_spent, tokens_acquired in rows:
             held_human = 0.0
             price = 0.0
@@ -647,10 +808,15 @@ def get_open_positions(w3=None, include_price=True) -> list:
             if acquired > 0:
                 entry_price = (eth_spent or 0) / acquired
             suggestion = "Sell 70% now (recoup + profit), moon bag 30% for moon"
-            if w3 and sender:
+            if w3 and senders:
                 try:
                     erc = w3.eth.contract(address=to_checksum_address(token), abi=ERC20_MIN_ABI)
-                    held = erc.functions.balanceOf(sender).call()
+                    held = 0
+                    for s in senders:
+                        try:
+                            held += erc.functions.balanceOf(s).call()
+                        except:
+                            pass
                     dec = get_token_decimals(w3, token)
                     held_human = held / (10 ** dec) if held else 0.0
                     if include_price:
@@ -1133,7 +1299,7 @@ def create_b20_live(w3: Web3, variant: int, salt: bytes, params: bytes, init_cal
         return None
 
     factory = get_b20_factory(w3)
-    account = w3.eth.account.from_key(os.getenv("PRIVATE_KEY"))
+    _, account = get_next_rotation_account(w3)
     sender = account.address
 
     # Build tx
@@ -1261,8 +1427,13 @@ def attempt_buy(w3: Web3, token: str, fee: int, amount_eth: float, cfg: dict,
     - Uses premium gas.
     - Retries once with higher gas / lower slippage if first fails (per spec).
     """
-    account = w3.eth.account.from_key(os.getenv("PRIVATE_KEY"))
+    private_key, account = get_next_rotation_account(w3)
     sender = account.address
+
+    if not check_rate_limit(cfg.get("MAX_BUYS_PER_MINUTE", 2)):
+        print("[RATE LIMIT] Exceeded max buys per minute. Throttling buy attempt.")
+        tg_send("⚠️ <b>Rate Limit Warning</b>: Snipe throttled to prevent spamming buys.")
+        return None
 
     # Use best pool finder for reliability
     pool, actual_fee = find_best_pool(w3, token)
@@ -1349,6 +1520,8 @@ def attempt_buy(w3: Web3, token: str, fee: int, amount_eth: float, cfg: dict,
                     pass
 
                 tx_hash = send_raw_transaction_safe(w3, signed.raw_transaction)
+                global recent_buys
+                recent_buys.append(time.time())
                 print("Buy tx sent:", tx_hash.hex())
                 tg_send(f"💰 Buy tx sent for <code>{token}</code>\nAmount: {amount_eth} ETH\nTx: <code>{tx_hash.hex()}</code>")
                 receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=90)
@@ -1449,7 +1622,33 @@ def attempt_sell(w3: Web3, token: str, fee: int, amount_token: int, cfg: dict, m
     """Basic sell logic for take profit or emergency. Uses exactInputSingle for token to ETH."""
     if not amount_token or amount_token <= 0:
         return None
-    account = w3.eth.account.from_key(os.getenv("PRIVATE_KEY"))
+    global accounts_list
+    selected_pk = os.getenv("PRIVATE_KEY")
+    account = w3.eth.account.from_key(selected_pk) if selected_pk else None
+    
+    if accounts_list:
+        best_acc = None
+        best_pk = None
+        best_bal = 0
+        erc = w3.eth.contract(address=to_checksum_address(token), abi=ERC20_MIN_ABI)
+        for pk, acc in accounts_list:
+            try:
+                bal = erc.functions.balanceOf(acc.address).call()
+                if bal > best_bal:
+                    best_bal = bal
+                    best_acc = acc
+                    best_pk = pk
+            except:
+                pass
+        if best_acc:
+            account = best_acc
+            selected_pk = best_pk
+            print(f"[ROTATION] Selling from wallet {account.address} holding {best_bal} tokens")
+            
+    if not account:
+        print("[ROTATION] ERROR: No wallet configured for sell.")
+        return None
+        
     sender = account.address
     pool = find_or_wait_pool(w3, token, WETH, fee) or find_or_wait_pool(w3, WETH, token, fee)
     if not pool:
@@ -1687,6 +1886,17 @@ def main():
     init_db()
     rpc_list = cfg.get("BACKUP_RPCS", []) or DEFAULT_BASE_RPCS
     w3 = get_working_w3(rpc_list)
+    init_accounts(w3)
+    global ACTIVE_POSITIONS
+    ACTIVE_POSITIONS = load_active_positions_from_db()
+    print(f"[MONITOR] Loaded {len(ACTIVE_POSITIONS)} active positions from DB.")
+    # Start background position monitor loop
+    position_monitor_thread = threading.Thread(
+        target=lambda: asyncio.run(monitor_positions_loop(w3, cfg)),
+        daemon=True
+    )
+    position_monitor_thread.start()
+    
     global current_w3
     current_w3 = w3
 
