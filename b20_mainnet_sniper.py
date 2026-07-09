@@ -549,10 +549,40 @@ def get_bot_address() -> str:
         pass
     return "N/A"
 
-def get_open_positions(w3=None) -> list:
+def get_num_open_positions() -> int:
+    """Fast count of open positions from DB only (no on-chain)."""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("""
+            SELECT COUNT(DISTINCT token) FROM trades 
+            WHERE status='success' 
+            AND action='buy'
+            GROUP BY token
+            HAVING SUM(CASE WHEN action='buy' THEN amount ELSE 0 END) > 0
+        """)
+        # simpler count
+        c.execute("""
+            SELECT COUNT(*) FROM (
+                SELECT token 
+                FROM trades 
+                WHERE status='success'
+                GROUP BY token
+                HAVING SUM(CASE WHEN action='buy' THEN amount ELSE 0 END) > 0
+            ) as t
+        """)
+        row = c.fetchone()
+        conn.close()
+        return row[0] if row else 0
+    except:
+        return 0
+
+
+def get_open_positions(w3=None, include_price=True) -> list:
     """Risk #65: get currently open positions from DB.
     If w3 provided, includes current price, value, PnL, moon bag suggestion.
     Made robust for new tokens where Quoter/price may fail.
+    Set include_price=False for faster calls when only held/spent needed.
     """
     try:
         conn = sqlite3.connect(DB_FILE)
@@ -592,10 +622,16 @@ def get_open_positions(w3=None) -> list:
                     held = erc.functions.balanceOf(sender).call()
                     dec = get_token_decimals(w3, token)
                     held_human = held / (10 ** dec) if held else 0.0
-                    price = get_token_price_in_eth(w3, token)
-                    value = held_human * price
-                    pnl = value - (eth_spent or 0)
-                    pnl_pct = (pnl / (eth_spent or 1) * 100) if eth_spent else 0
+                    if include_price:
+                        price = get_token_price_in_eth(w3, token)
+                        value = held_human * price
+                        pnl = value - (eth_spent or 0)
+                        pnl_pct = (pnl / (eth_spent or 1) * 100) if eth_spent else 0
+                    else:
+                        price = 0.0
+                        value = 0.0
+                        pnl = 0.0
+                        pnl_pct = 0.0
                 except Exception as e:
                     # Price or balance may fail for very new tokens (Quoter reverts, thin liq)
                     # Still show real on-chain held + spent from DB
@@ -618,20 +654,21 @@ def get_open_positions(w3=None) -> list:
             note = ""
             if acquired == 0 and eth_spent > 0:
                 note = "0 tokens received from swap (tax/liq/redirect?)"
-            positions.append({
-                'token': token,
-                'symbol': sym,
-                'eth_spent': eth_spent or 0,
-                'held': held_human,
-                'acquired': acquired,
-                'entry_price_eth': entry_price,
-                'price_eth': price,
-                'value_eth': value,
-                'pnl_eth': pnl,
-                'pnl_pct': pnl_pct,
-                'suggestion': suggestion,
-                'note': note
-            })
+            if acquired > 0 or held_human > 0:
+                positions.append({
+                    'token': token,
+                    'symbol': sym,
+                    'eth_spent': eth_spent or 0,
+                    'held': held_human,
+                    'acquired': acquired,
+                    'entry_price_eth': entry_price,
+                    'price_eth': price,
+                    'value_eth': value,
+                    'pnl_eth': pnl,
+                    'pnl_pct': pnl_pct,
+                    'suggestion': suggestion,
+                    'note': note
+                })
         return positions
     except Exception as e:
         print(f"get_open_positions error: {e}")
@@ -1261,6 +1298,15 @@ def attempt_buy(w3: Web3, token: str, fee: int, amount_eth: float, cfg: dict,
             # Send the tx (even if sim failed on final attempt)
             signed = account.sign_transaction(tx)
             try:
+                # record balance before for accurate net received (accounts for tax on transfer)
+                balance_before = 0
+                try:
+                    erc = w3.eth.contract(address=to_checksum_address(token), abi=ERC20_MIN_ABI)
+                    dec = get_token_decimals(w3, token)
+                    balance_before = erc.functions.balanceOf(sender).call()
+                except:
+                    pass
+
                 tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
                 print("Buy tx sent:", tx_hash.hex())
                 tg_send(f"💰 Buy tx sent for <code>{token}</code>\nAmount: {amount_eth} ETH\nTx: <code>{tx_hash.hex()}</code>")
@@ -1271,31 +1317,49 @@ def attempt_buy(w3: Web3, token: str, fee: int, amount_eth: float, cfg: dict,
                     # This captures what the swap/pool actually delivered, even if token has tax/burn
                     received_tokens = 0.0
                     try:
+                        erc = w3.eth.contract(address=to_checksum_address(token), abi=ERC20_MIN_ABI)
+                        dec = get_token_decimals(w3, token)
+                        balance_after = erc.functions.balanceOf(sender).call()
+                        received_tokens = max(0, (balance_after - balance_before) / (10 ** dec))
+                    except Exception as be:
+                        print(f"balance delta error: {be}")
+
+                    # Also parse Transfer and Swap logs for gross amount (before tax)
+                    try:
                         transfer_topic = keccak(text="Transfer(address,address,uint256)").hex()
+                        swap_topic = keccak(text="Swap(address,address,int256,int256,uint160,uint128,int24)").hex()
+                        gross = 0.0
                         for log in receipt.get("logs", []):
-                            if (log.get("address", "").lower() == token.lower() and
-                                len(log.get("topics", [])) >= 3):
-                                topic0 = log["topics"][0].hex() if hasattr(log["topics"][0], "hex") else log["topics"][0]
-                                if topic0.lower().endswith(transfer_topic.lower()):
-                                    # topics[2] is the 'to' address (padded)
-                                    to_padded = log["topics"][2].hex() if hasattr(log["topics"][2], "hex") else str(log["topics"][2])
+                            addr = log.get("address", "").lower()
+                            topics = log.get("topics", [])
+                            if len(topics) >= 3:
+                                topic0 = topics[0].hex() if hasattr(topics[0], "hex") else str(topics[0])
+                                if addr == token.lower() and topic0.lower().endswith(transfer_topic.lower()):
+                                    to_padded = topics[2].hex() if hasattr(topics[2], "hex") else str(topics[2])
                                     to_addr = "0x" + to_padded[-40:]
                                     if to_addr.lower() == sender.lower():
                                         data = log.get("data", b"")
                                         if isinstance(data, str):
                                             data = bytes.fromhex(data[2:] if data.startswith("0x") else data)
                                         amount = int.from_bytes(data, "big")
-                                        dec = get_token_decimals(w3, token)
-                                        received_tokens = amount / (10 ** dec) if amount else 0.0
-                                        break
-                        if received_tokens == 0:
-                            # Fallback to balance query (in case logs parsing missed it)
-                            erc = w3.eth.contract(address=to_checksum_address(token), abi=ERC20_MIN_ABI)
-                            dec = get_token_decimals(w3, token)
-                            bal = erc.functions.balanceOf(sender).call()
-                            received_tokens = bal / (10 ** dec) if bal else 0.0
+                                        gross = max(gross, amount / (10 ** dec))
+                                elif pool and addr == pool.lower() and topic0.lower().endswith(swap_topic.lower()):
+                                    # parse swap for output amount
+                                    data = log.get("data", b"")
+                                    if isinstance(data, str):
+                                        data = bytes.fromhex(data[2:] if data.startswith("0x") else data)
+                                    amount0 = int.from_bytes(data[0:32], "big", signed=True)
+                                    amount1 = int.from_bytes(data[32:64], "big", signed=True)
+                                    # take the positive amount for the output (the one the buyer receives)
+                                    out_amount = max(abs(amount0), abs(amount1))
+                                    gross = max(gross, out_amount / (10 ** dec))
+                        if gross > received_tokens:
+                            received_tokens = gross
                     except Exception as be:
-                        print(f"Could not parse received tokens from logs: {be}")
+                        print(f"log parse error: {be}")
+
+                    if received_tokens == 0:
+                        # final fallback
                         try:
                             erc = w3.eth.contract(address=to_checksum_address(token), abi=ERC20_MIN_ABI)
                             dec = get_token_decimals(w3, token)

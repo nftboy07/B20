@@ -127,6 +127,9 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /history /recent [n] /lastbuy /open
 /tx <hash>         /export /csv
 
+**More**
+/balance /price /pools /tx /buy /sell /blacklist /addblack /remblack /liq /simulate /safety /perftoken /pools /activation /rpc /gas /config /refresh
+
 **Management**
 /blacklist <token>   /blacklistlist
 /addblack <token>    /remblack <token>
@@ -236,46 +239,39 @@ async def positions_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 sender = use_w3.eth.account.from_key(os.getenv("PRIVATE_KEY")).address
         except:
             pass
-        real_opens = [p for p in opens if p.get('acquired', 0) > 0 or p.get('held', 0) > 0]
-        zero_received = [p for p in opens if p.get('acquired', 0) == 0 and p.get('eth_spent', 0) > 0]
-        if not real_opens and not zero_received:
-            msg = "📊 No open positions yet (no successful buys in DB or zero held).\nBuy via buttons or /buy <tok> <eth>"
+        if not opens:
+            msg = "📊 No open positions yet (no successful buys in DB).\nBuy via buttons or /buy <tok> <eth>"
         else:
-            msg = f"📊 OPEN POSITIONS (REAL on-chain + DB)\nWallet used for balances: {sender}\n\n"
+            msg = f"📊 OPEN POSITIONS (REAL on-chain + DB)\nWallet: {sender}\n\n"
             realized_loss = 0.0
-            for p in real_opens:
+            for p in opens:
                 sym = p.get('symbol', '') or ''
                 tshort = p['token'][:10] + "..."
                 label = f"{sym} {tshort}" if sym else tshort
-                msg += f"Token: {label}\n"
-                msg += f"  Acquired at buy (DB): {p.get('acquired', 0):.8f}\n"
-                msg += f"  Held (on-chain now): {p.get('held', 0):.8f}\n"
-                msg += f"  ETH spent (DB): {p.get('eth_spent', 0):.6f}\n"
-                ep = p.get('entry_price_eth', 0)
-                if ep > 0:
-                    msg += f"  Entry price: {ep:.10f} ETH per token\n"
-                val = p.get('value_eth', 0)
-                if val > 0:
-                    msg += f"  Est Value: {val:.6f} ETH\n"
-                    msg += f"  PnL: {p.get('pnl_eth',0):.6f} ETH ({p.get('pnl_pct',0):.1f}%)\n"
-                else:
-                    msg += "  Est Value: N/A (Quoter/price pending for fresh token)\n"
-                    msg += "  PnL: N/A\n"
-                msg += f"  Strategy: {p.get('suggestion','moon bag 30%')}\n\n"
-            for p in zero_received:
+                acq = p.get('acquired', 0)
+                held = p.get('held', 0)
                 spent = p.get('eth_spent', 0)
-                realized_loss += spent
-                sym = p.get('symbol', '') or ''
-                tshort = p['token'][:10] + "..."
-                label = f"{sym} {tshort}" if sym else tshort
-                msg += f"Token: {label}\n  Spent {spent:.6f} ETH but 0 tokens received (tax/liq/redirect?)\n  Realized loss: -{spent:.6f} ETH\n\n"
+                ep = p.get('entry_price_eth', 0)
+                val = p.get('value_eth', 0)
+                msg += f"Token: {label}\n"
+                msg += f"  Acquired (at buy): {acq:.8f}\n"
+                msg += f"  Held (live): {held:.8f}\n"
+                msg += f"  Spent: {spent:.6f} ETH\n"
+                if ep > 0:
+                    msg += f"  Entry price: {ep:.10f} ETH/token\n"
+                if val > 0:
+                    msg += f"  Value: {val:.6f} PnL: {p.get('pnl_eth',0):.6f} ({p.get('pnl_pct',0):.1f}%)\n"
+                else:
+                    msg += "  Value/PnL: N/A (price pending)\n"
+                if acq == 0 and spent > 0:
+                    realized_loss += spent
+                    msg += "  ⚠️ 0 acquired - likely tax/redirect. Realized loss.\n"
+                msg += f"  Strategy: {p.get('suggestion','moon bag 30%')}\n\n"
             if realized_loss > 0:
-                msg += f"Total realized loss from failed receives: -{realized_loss:.6f} ETH\n"
-            msg += "Moon bag = 30% hold for potential moon. Use /sell <tok> 25 or sell buttons.\n"
-            msg += "Tip: /balance <tok> for exact held, /price <tok> for live quote.\n"
-            msg += "To check if profitable (even if positions show N/A): /balance <tok> then /price <tok>. Calc: held * price vs spent.\n"
-            msg += "You can sell anytime with buttons or /sell even if you can't see clear profit in /positions."
-            msg += "\nNote: Positions with 0 acquired are shown as realized losses (no tokens credited on-chain)."
+                msg += f"Total realized loss (0-received): -{realized_loss:.6f} ETH\n"
+            msg += "Moon bag = 30% hold. Use sell buttons or /sell.\n"
+            msg += "Check profit: /profit <tok> or /balance + /price.\n"
+            msg += "Sell anytime - buttons use live balance, not this view."
     except Exception as e:
         msg = f"📊 Positions error: {e}"
     await update.message.reply_text(msg)
@@ -1288,6 +1284,24 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "cmd_remblack":
         await query.edit_message_text("Use /remblack <token> to remove (real)")
 
+    elif data == "cmd_balance":
+        await query.message.reply_text("Use /balance <token> for live on-chain balance (real).")
+
+    elif data == "cmd_price":
+        await query.message.reply_text("Use /price <token> for live Quoter price (real mainnet).")
+
+    elif data == "cmd_pools":
+        await query.message.reply_text("Use /pools <token> for real pool + liq info.")
+
+    elif data == "cmd_tx":
+        await query.message.reply_text("Use /tx <hash> for real tx details + basescan link.")
+
+    elif data == "cmd_buy":
+        await query.message.reply_text("Use /buy <token> <eth> to manual buy (real tx). Example: /buy 0x... 0.003")
+
+    elif data == "cmd_sell":
+        await query.message.reply_text("Use /sell <token> <pct> or the TP buttons after buys. Uses live balance.")
+
     elif data == "cmd_help" or data == "cmd_commands":
         await query.edit_message_text(
             "All commands via text: /help or /list\n"
@@ -1594,6 +1608,16 @@ def get_main_menu_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton("📊 Perftoken", callback_data="cmd_perftoken"),
             InlineKeyboardButton("🖤 AddBlack", callback_data="cmd_addblack"),
             InlineKeyboardButton("🖤 RemBlack", callback_data="cmd_remblack"),
+        ],
+        [
+            InlineKeyboardButton("💰 Balance", callback_data="cmd_balance"),
+            InlineKeyboardButton("💲 Price", callback_data="cmd_price"),
+            InlineKeyboardButton("🏊 Pools", callback_data="cmd_pools"),
+        ],
+        [
+            InlineKeyboardButton("📤 Tx", callback_data="cmd_tx"),
+            InlineKeyboardButton("🛒 Buy", callback_data="cmd_buy"),
+            InlineKeyboardButton("💸 Sell", callback_data="cmd_sell"),
         ],
         [
             InlineKeyboardButton("⚙️ Config", callback_data="cmd_config"),
