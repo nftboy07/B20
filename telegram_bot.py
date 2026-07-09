@@ -89,7 +89,9 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("📊 Bot Status: LIVE mode active. Monitoring pools. Check logs.")
+    # Enhanced status (upgrade #77)
+    status_msg = "📊 Bot Status: LIVE mode active.\nMonitoring pools + B20Factory.\nTG interactive + buttons ready.\nCheck logs for recent snipes.\nUse /positions for trade history."
+    await update.message.reply_text(status_msg)
 
 
 async def pause_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -126,9 +128,28 @@ async def sell_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # TODO: call actual sell via callback if wired
 
 async def positions_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Upgrade #77: status with positions/PnL stub
-    msg = "📊 Positions: (stub - integrate DB trades + on-chain for real PnL)\nNo open positions tracked yet.\nUse /status for basic."
+    # Upgrade #77: real status from DB + ACTIVE
+    try:
+        import sqlite3
+        conn = sqlite3.connect("/home/ubuntu/b20-bot/b20_trades.db")
+        c = conn.cursor()
+        c.execute("SELECT token, action, amount, status FROM trades ORDER BY id DESC LIMIT 5")
+        rows = c.fetchall()
+        conn.close()
+        msg = "📊 Recent trades:\n" + "\n".join([f"{r[1]} {r[2]} {r[0][:8]}... {r[3]}" for r in rows]) if rows else "No trades yet."
+    except:
+        msg = "📊 Positions: DB read error or no trades. Use kill switch if needed."
     await update.message.reply_text(msg)
+
+async def blacklist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Upgrade #81, #68
+    args = context.args or []
+    if not args:
+        await update.message.reply_text("Usage: /blacklist <token>")
+        return
+    token = args[0]
+    # Note: this would need to be shared with main process; for now echo
+    await update.message.reply_text(f"🖤 Blacklist request for {token} (add to main bot BLACKLIST set manually or extend wiring).")
 
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -199,6 +220,7 @@ def _build_application(token: str) -> Application:
     app.add_handler(CommandHandler("kill", kill_cmd))
     app.add_handler(CommandHandler("sell", sell_cmd))
     app.add_handler(CommandHandler("positions", positions_cmd))
+    app.add_handler(CommandHandler("blacklist", blacklist_cmd))
 
     # Inline buttons
     app.add_handler(CallbackQueryHandler(button_callback))

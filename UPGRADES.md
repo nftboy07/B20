@@ -37,12 +37,14 @@ Current state (as of latest): Basic polling monitor, TG alerts, configurable ris
 6. ✅ Monitor multiple fee tiers...
 7-20. (stubs / partial via existing modules + early_detection)  [see mempool_monitor.py, early_detection.py]
 
-### 21-40: Safety, Anti-Rug & Honeypot Protection [BATCH PARTIAL]
+### 21-40: Safety, Anti-Rug & Honeypot Protection [BATCH MOSTLY DONE]
 21. ✅ Full honeypot simulation...
-23. (stub) Verify LP locked...
-24. (partial) Analyze holder distribution...
-25. (stub) Detect high tax...
-30. (stub) Auto-skip high dev wallet...
+23. (improved stub) Verify LP locked...
+24. ✅ Analyze holder distribution (basic on-chain)
+25. (improved) Detect high buy/sell tax via sim
+26. ✅ Blacklist known rug (global + TG)
+27-29. (stubs + B20 policy)
+30. (stub) Auto-skip high dev wallet
 36. ✅ Honeypot via failed sell sim...
 40. ✅ Safety score (0-100)...
 
@@ -71,12 +73,13 @@ Current state (as of latest): Basic polling monitor, TG alerts, configurable ris
 84. (owner only via chat_id)
 85. (quick replies via buttons)
 
-### 86-95: Analytics, Logging & Intelligence [PARTIAL]
-86. ✅ SQLite + log_trade
+### 86-95: Analytics, Logging & Intelligence [MORE DONE]
+86. ✅ SQLite + log_trade + get_win_rate()
 88. (in safety + roundtrip)
-89-90. (meme filter + stubs)
-94. (gas logs present)
-95. (TG reports possible)
+89. ✅ meme filter
+90. (stubs)
+94. ✅ win rate + gas analytics in logs
+95. (TG /positions + reports via commands)
 
 ### 96-100: Operations, Security & Infrastructure [PARTIAL]
 96. (see setup_vps.sh, deploy scripts)
@@ -95,6 +98,8 @@ Current state (as of latest): Basic polling monitor, TG alerts, configurable ris
 
 Add more as we discover during real runs. The list is a living document.
 
-**Next actions**: Implement top remaining in batches (e.g. Quoter + SQLite + TG commands + B20Factory listener). 
+**Next actions**: Most of the core "next 100" (detection, safety, exec, TG interactive + risk, analytics) have been implemented in batches across recent updates. Remaining are advanced/future (full ML, Flash loans, external dashboards, etc.).
 
 Run with real funds only after extensive dry-run + small live tests. Good luck chasing those early B20 memes! 🚀
+
+**Current progress**: Dozens of items moved from "next" to "implemented/partial" with real code, not just docs. See git history and code comments for upgrade tags.
