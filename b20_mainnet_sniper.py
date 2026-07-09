@@ -155,8 +155,8 @@ WETH                = to_checksum_address("0x42000000000000000000000000000000000
 USDC                = to_checksum_address("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913")
 
 # Aerodrome (Base main DEX V2) for additional pairs (upgrade for multi-DEX)
-AERODROME_FACTORY = to_checksum_address("0x420DD381b31aEa2B3b2d6b8c5e9a6c5c5c5c5c5c")  # placeholder, update with real if used
-AERODROME_ROUTER  = to_checksum_address("0x420DD381b31aEa2B3b2d6b8c5e9a6c5c5c5c5c5c5c")  # placeholder
+# Real addresses (update if needed): Factory ~0x420DD381b31aEa2B3b2d6b8c5e9a6c5c5c5c5c5c wait, use correct from docs if adding full support.
+# For now stub to avoid errors.
 
 # Uniswap V3 QuoterV2 on Base for accurate pricing (critical for real slippage)
 UNISWAP_QUOTER_V2   = to_checksum_address("0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a")
@@ -849,10 +849,8 @@ def find_or_wait_pool(w3: Web3, token_a: str, token_b: str, fee: int) -> Optiona
     return None
 
 def find_aerodrome_pool(w3: Web3, token_a: str, token_b: str) -> Optional[str]:
-    """Aerodrome support (upgrade for multi DEX #11)."""
-    # Placeholder: in real, use Aerodrome factory getPool or similar.
-    # For now, return None or integrate if ABI added.
-    print("[Aerodrome] Stub - using Uniswap for now")
+    """Aerodrome support (upgrade for multi DEX #11). Stub for now."""
+    print("[Aerodrome] Stub - using Uniswap V3 for now")
     return None
 
 def build_buy_tx(w3: Web3, token_out: str, fee: int, amount_in_wei: int, min_out: int, recipient: str) -> dict:
