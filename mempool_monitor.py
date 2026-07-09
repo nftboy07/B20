@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import time
+import websockets
 from datetime import datetime, timezone
 from typing import Dict, Callable, Optional, List, Set, Tuple
 from dataclasses import dataclass
@@ -117,29 +118,40 @@ class MempoolMonitor:
         self.callbacks.append(callback)
 
     async def watch_pending_transactions(self):
-        """Watch for pending transactions in mempool."""
+        """Watch for pending transactions in mempool using websockets subscription."""
         logger.info("👀 Watching mempool for pending transactions...")
         
-        try:
-            # Create filter for pending transactions
-            filter_obj = self.w3.eth.filter('pending')
-            
-            while self.is_running:
-                try:
-                    # Get pending transaction hashes
-                    tx_hashes = filter_obj.get_new_entries()
+        while self.is_running:
+            try:
+                async with websockets.connect(self.ws_rpc) as ws:
+                    # Send subscription request
+                    sub_req = {
+                        "jsonrpc": "2.0",
+                        "method": "eth_subscribe",
+                        "params": ["newPendingTransactions"],
+                        "id": 1
+                    }
+                    await ws.send(json.dumps(sub_req))
                     
-                    for tx_hash in tx_hashes:
-                        await self._process_pending_tx(tx_hash.hex())
+                    # Read confirmation message
+                    conf_msg = await ws.recv()
+                    logger.debug(f"Subscription confirmation: {conf_msg}")
                     
-                    await asyncio.sleep(0.1)  # Non-blocking wait
-                    
-                except Exception as e:
-                    logger.error(f"⚠️ Error in mempool watch: {e}")
-                    await asyncio.sleep(1)
-        
-        except Exception as e:
-            logger.error(f"❌ Critical error in mempool watcher: {e}")
+                    while self.is_running:
+                        try:
+                            msg = await ws.recv()
+                            data = json.loads(msg)
+                            
+                            # Extract transaction hash from subscription notification
+                            if 'params' in data and 'result' in data['params']:
+                                tx_hash = data['params']['result']
+                                asyncio.create_task(self._process_pending_tx(tx_hash))
+                        except Exception as inner_e:
+                            logger.error(f"⚠️ Error receiving websocket message: {inner_e}")
+                            break
+            except Exception as e:
+                logger.error(f"⚠️ Websocket connection error: {e}. Retrying in 5 seconds...")
+                await asyncio.sleep(5)
 
     async def _process_pending_tx(self, tx_hash: str):
         """Process single pending transaction."""
