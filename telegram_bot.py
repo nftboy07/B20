@@ -97,11 +97,11 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _send_control_panel(update, context)
     await update.message.reply_text(
         "More commands (real mainnet):\n"
-        "/status /positions /pnl /spent /value /open\n"
+        "/status /positions /pnl /spent /value /open /perftoken <tok>\n"
         "/ethbalance /balance <tok> /price <tok> /token <tok>\n"
-        "/pools <tok> /safety <tok> /gas /config\n"
+        "/pools <tok> /safety <tok> /gas /config /stats /recent\n"
         "/history /tx <hash> /buy <tok> <amt> /sell <tok> <pct>\n"
-        "/blacklistlist /export\n"
+        "/blacklistlist /export /activation /rpc /refresh\n"
         "Buttons on detections + after buys. Use /tx to verify transfers."
     )
 
@@ -588,6 +588,111 @@ async def blacklistlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Blacklist error: {e}")
 
 
+async def recent_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Last few buys with real acquired data."""
+    args = context.args or []
+    n = 5
+    if args:
+        try: n = max(1, min(10, int(args[0])))
+        except: pass
+    try:
+        import sqlite3
+        conn = sqlite3.connect("b20_trades.db")
+        c = conn.cursor()
+        c.execute("SELECT timestamp, token, amount, tx_hash, status, COALESCE(token_amount,0) FROM trades WHERE action='buy' ORDER BY id DESC LIMIT ?", (n,))
+        rows = c.fetchall()
+        conn.close()
+        if not rows:
+            await update.message.reply_text("No recent buys.")
+            return
+        msg = f"📜 Last {len(rows)} buys:\n"
+        for ts, tok, amt, txh, st, acquired in rows:
+            short = tok[:8] + "..." if tok else "?"
+            msg += f"{ts[:16]} {short} spent={amt} acq={acquired:.2f} {st}\nTx: {txh[:10]}...\n"
+        await update.message.reply_text(msg)
+    except Exception as e:
+        await update.message.reply_text(f"Recent error: {e}")
+
+
+async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Detailed stats."""
+    try:
+        from b20_mainnet_sniper import get_detailed_stats, get_total_spent, get_win_rate
+        st = get_detailed_stats()
+        wr = get_win_rate()
+        msg = (f"📊 STATS\n"
+               f"Successful buys: {st['successful_buys']}\n"
+               f"Total spent: {st['total_spent']:.4f} ETH\n"
+               f"Sells: {st['sells']}\n"
+               f"Win rate: {wr:.1f}%\n"
+               f"Buys logged: {st['total_buys_logged']}")
+        await update.message.reply_text(msg)
+    except Exception as e:
+        await update.message.reply_text(f"Stats error: {e}")
+
+
+async def activation_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """B20 activation status (real on-chain)."""
+    use_w3 = _current_w3
+    if not use_w3:
+        await update.message.reply_text("No w3.")
+        return
+    try:
+        from b20_mainnet_sniper import get_activation_status
+        res = get_activation_status(use_w3)
+        await update.message.reply_text(f"🔓 {res}")
+    except Exception as e:
+        await update.message.reply_text(f"Activation error: {e}")
+
+
+async def rpc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Current RPC status."""
+    if _cfg:
+        rpc = _cfg.get('RPC_URL', 'N/A')
+        backups = len(_cfg.get('BACKUP_RPCS', []))
+        await update.message.reply_text(f"🌐 RPC: {rpc[:40]}...\nBackups configured: {backups}")
+    else:
+        await update.message.reply_text("No cfg.")
+
+
+async def perftoken_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """PnL / details for specific token."""
+    args = context.args or []
+    if not args:
+        await update.message.reply_text("Usage: /perftoken <token>")
+        return
+    token = args[0]
+    use_w3 = _current_w3
+    try:
+        from b20_mainnet_sniper import get_open_positions, get_token_price_in_eth
+        opens = [p for p in get_open_positions(use_w3) if p['token'].lower() == token.lower() or p.get('symbol','').lower() == token.lower()]
+        if not opens:
+            await update.message.reply_text("No position for that token.")
+            return
+        p = opens[0]
+        price = get_token_price_in_eth(use_w3, p['token']) if use_w3 else 0
+        val = p['held'] * price
+        pnl = val - p['eth_spent']
+        msg = (f"Token: {p['token'][:10]}...\n"
+               f"Held: {p['held']:.4f} Acquired: {p['acquired']:.4f}\n"
+               f"Spent: {p['eth_spent']:.4f}\n"
+               f"Current price: {price:.10f}\n"
+               f"Value: {val:.6f} PnL: {pnl:.6f}")
+        await update.message.reply_text(msg)
+    except Exception as e:
+        await update.message.reply_text(f"Perf error: {e}")
+
+
+async def refresh_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Force refresh positions data (re-query balances)."""
+    try:
+        from b20_mainnet_sniper import get_open_positions
+        opens = get_open_positions(_current_w3)
+        await update.message.reply_text(f"Refreshed. {len(opens)} positions loaded.")
+    except Exception as e:
+        await update.message.reply_text(f"Refresh error: {e}")
+
+
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -707,6 +812,12 @@ def _build_application(token: str) -> Application:
     app.add_handler(CommandHandler("config", config_cmd))
     app.add_handler(CommandHandler("open", open_cmd))
     app.add_handler(CommandHandler("blacklistlist", blacklistlist_cmd))
+    app.add_handler(CommandHandler("recent", recent_cmd))
+    app.add_handler(CommandHandler("stats", stats_cmd))
+    app.add_handler(CommandHandler("activation", activation_cmd))
+    app.add_handler(CommandHandler("rpc", rpc_cmd))
+    app.add_handler(CommandHandler("perftoken", perftoken_cmd))
+    app.add_handler(CommandHandler("refresh", refresh_cmd))
 
     # Inline buttons
     app.add_handler(CallbackQueryHandler(button_callback))

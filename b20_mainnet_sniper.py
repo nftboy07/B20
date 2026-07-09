@@ -742,6 +742,36 @@ def run_token_safety(w3: Web3, token: str) -> str:
     except Exception as e:
         return f"Safety check error: {str(e)[:80]}"
 
+
+def get_detailed_stats() -> dict:
+    """More analytics from DB."""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*), SUM(amount) FROM trades WHERE action='buy' AND status='success'")
+        buys, spent = c.fetchone()
+        c.execute("SELECT COUNT(*) FROM trades WHERE action='buy' AND status='success'")
+        total_buys = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM trades WHERE action='sell' AND status='success'")
+        sells = c.fetchone()[0]
+        conn.close()
+        return {
+            'successful_buys': buys or 0,
+            'total_spent': spent or 0,
+            'sells': sells or 0,
+            'total_buys_logged': total_buys or 0
+        }
+    except:
+        return {'successful_buys': 0, 'total_spent': 0, 'sells': 0}
+
+
+def get_activation_status(w3: Web3) -> str:
+    try:
+        activated = check_b20_activated(w3)
+        return f"B20 Activated: {'YES' if activated else 'NO'} (as of now)"
+    except Exception as e:
+        return f"Activation check error: {e}"
+
 def check_token_safety(w3: Web3, token: str, min_liq: float) -> tuple[bool, str]:
     """Enhanced safety checks to avoid honeypots, rugs, etc. Returns (is_safe, reason)"""
     try:
