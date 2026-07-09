@@ -318,27 +318,24 @@ def get_w3(rpc_url: str) -> Web3:
     return w3
 
 def get_working_w3(rpc_list: list = None, max_attempts: int = 5) -> Web3:
-    """Try multiple RPCs until one works. Rotates list for load balancing.
-    This is key for surviving rate limits during meme launches.
-    Tests chainId + eth_call for full compatibility.
+    """Try multiple RPCs until one works.
+    Tries in provided order (put paid/fast ones first in BACKUP_RPCS for lowest latency sniping/buttons).
+    No shuffle so user-provided RPCs are preferred.
     """
     if not rpc_list:
         rpc_list = DEFAULT_BASE_RPCS
-    rpc_list = list(rpc_list)  # copy
-    random.shuffle(rpc_list)  # randomize to distribute load
+    rpc_list = list(rpc_list)  # copy - order matters: paid first = faster buttons/auto-snipes
     for _ in range(max_attempts):
         for rpc in rpc_list:
             try:
                 w3 = get_w3(rpc)
-                # Strong health check: chain + simple call
                 if w3.eth.chain_id == CHAIN_ID:
-                    # Simple health: just chain_id is enough for most, avoid eth_call on precompiles if restricted
                     print(f"Using RPC: {rpc[:50]}...")
                     return w3
             except Exception as e:
                 print(f"RPC {rpc[:30]}... failed: {str(e)[:60]}, trying next...")
                 continue
-        time.sleep(1)  # brief pause before retry
+        time.sleep(0.5)  # brief pause before full retry
     raise Exception("No working RPC found after attempts. Check your internet or add more RPCs in .env")
 
 # =============================================================================
@@ -388,7 +385,18 @@ def check_tg_commands(cfg: dict, w3=None):
             offset = 0
 
     def _execute_buy(use_w3, tkn, amt, cfg):
-        """Run in separate thread so TG polling stays responsive."""
+        """Run in separate thread so TG polling stays responsive.
+        Refreshes to a good RPC (user paid ones first) for fast quote/tx on button press.
+        """
+        global current_w3
+        try:
+            # Prefer fast RPC for the buy execution itself (critical for button "speed" feel)
+            rpc_list = cfg.get("BACKUP_RPCS", []) or DEFAULT_BASE_RPCS
+            fresh = get_working_w3(rpc_list)
+            current_w3 = fresh
+            use_w3 = fresh
+        except Exception:
+            pass  # fall back to whatever we had
         try:
             tg_send(f"Executing buy {amt} ETH on {tkn}...")
             f = 3000
@@ -603,7 +611,8 @@ def is_feature_activated(w3: Web3, feature_hash: bytes) -> bool:
 def check_b20_activated(w3: Web3, want_stable: bool = False) -> bool:
     feature = FEATURE_B20_STABLECOIN if want_stable else FEATURE_B20_ASSET
     activated = is_feature_activated(w3, feature)
-    print(f"B20 {'STABLECOIN' if want_stable else 'ASSET'} activated: {activated}")
+    # Only log on transitions to avoid log spam (was flooding every 30s)
+    # The value is still used for gating.
     return activated
 
 def get_b20_factory(w3: Web3):
