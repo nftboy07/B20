@@ -10,8 +10,9 @@ Key advantage: Get in before other bots see the transaction
 import asyncio
 import json
 import logging
+import time
 from datetime import datetime, timezone
-from typing import Dict, Callable, Optional, List, Set
+from typing import Dict, Callable, Optional, List, Set, Tuple
 from dataclasses import dataclass
 
 from web3 import Web3
@@ -53,6 +54,7 @@ class MempoolMonitor:
     # Target contract addresses
     B20_FACTORY = to_checksum_address("0xB20f000000000000000000000000000000000000")
     UNISWAP_V3_FACTORY = to_checksum_address("0x33128a8fC17869897dcE68Ed026d694621f6FDfD")
+    UNISWAP_V3_ROUTER = to_checksum_address("0xE592427A0AEce92De3Edee1F18E0157C05861564")
     
     # Function signatures to watch
     B20_CREATE_TOKEN = "0x12345678"  # Placeholder - actual from contract
@@ -77,6 +79,7 @@ class MempoolMonitor:
         self.on_pool_detected = on_pool_detected
         self.w3 = None
         self.pending_txs: Set[str] = set()
+        self.pending_swaps: Dict[str, List[Dict]] = {}
         self.is_running = False
         self.callbacks: List[Callable] = []
         self.stats = {
@@ -159,8 +162,8 @@ class MempoolMonitor:
             
             to_addr = to_checksum_address(to_addr)
             
-            # Check if target is our factory
-            if to_addr not in [self.B20_FACTORY, self.UNISWAP_V3_FACTORY]:
+            # Check if target is our factory or the router
+            if to_addr not in [self.B20_FACTORY, self.UNISWAP_V3_FACTORY, self.UNISWAP_V3_ROUTER]:
                 return
             
             # Decode function signature
@@ -173,6 +176,10 @@ class MempoolMonitor:
             # Handle Uniswap pool creations
             elif to_addr == self.UNISWAP_V3_FACTORY and func_sig == "0x883164f5":
                 await self._handle_pool_creation_tx(tx_hash, tx, data)
+                
+            # Handle Uniswap Router swaps
+            elif to_addr == self.UNISWAP_V3_ROUTER:
+                await self._handle_router_tx(tx_hash, tx, data)
         
         except Exception as e:
             logger.debug(f"Error processing tx {tx_hash[:8]}: {e}")
@@ -269,6 +276,81 @@ class MempoolMonitor:
         
         except Exception as e:
             logger.debug(f"Error decoding pool creation: {e}")
+
+    def decode_exact_input_single(self, data_hex: str) -> Optional[Tuple[str, str, int, int]]:
+        """Decode Uniswap V3 exactInputSingle parameters.
+        Returns: (token_in, token_out, fee, amount_in) or None
+        """
+        try:
+            if len(data_hex) < 10 or not data_hex.startswith("0x414bf389"):
+                return None
+            # Remove function selector
+            body = bytes.fromhex(data_hex[10:])
+            decoded = decode(['(address,address,uint24,address,uint256,uint256,uint256,uint160)'], body)
+            params = decoded[0]
+            return (params[0], params[1], params[2], params[5])
+        except Exception as e:
+            logger.debug(f"Failed to decode exactInputSingle: {e}")
+            return None
+
+    async def _handle_router_tx(self, tx_hash: str, tx: Dict, data: str):
+        """Track pending swaps on Uniswap V3 Router."""
+        func_sig = data[:10] if len(data) >= 10 else None
+        if func_sig == "0x414bf389":  # exactInputSingle
+            parsed = self.decode_exact_input_single(data)
+            if parsed:
+                token_in, token_out, fee, amount_in = parsed
+                # Identify the target token (non-WETH / non-USDC)
+                weth_addr = to_checksum_address("0x4200000000000000000000000000000000000006")
+                usdc_addr = to_checksum_address("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913")
+                
+                target_token = token_out if to_checksum_address(token_in) in [weth_addr, usdc_addr] else token_in
+                target_token = to_checksum_address(target_token)
+                
+                swap_info = {
+                    'tx_hash': tx_hash,
+                    'from': tx.get('from'),
+                    'token_in': to_checksum_address(token_in),
+                    'token_out': to_checksum_address(token_out),
+                    'fee': fee,
+                    'amount_in': amount_in,
+                    'gas_price': tx.get('gasPrice', 0) or tx.get('maxFeePerGas', 0),
+                    'timestamp': time.time()
+                }
+                
+                if target_token not in self.pending_swaps:
+                    self.pending_swaps[target_token] = []
+                self.pending_swaps[target_token].append(swap_info)
+                
+                # Cleanup old pending swaps (older than 30s)
+                current_time = time.time()
+                self.pending_swaps[target_token] = [
+                    s for s in self.pending_swaps[target_token]
+                    if current_time - s['timestamp'] < 30
+                ]
+
+    def is_token_sandwiched(self, token_address: str, our_gas_price: int = 0) -> Tuple[bool, int, str]:
+        """Check if a token has active sandwich/front-run activity in the mempool.
+        Returns: (is_sandwiched, count_higher_gas_swaps, details_string)
+        """
+        token_address = to_checksum_address(token_address)
+        swaps = self.pending_swaps.get(token_address, [])
+        if not swaps:
+            return False, 0, "No pending swaps"
+            
+        current_time = time.time()
+        # Filter to fresh swaps (last 15 seconds)
+        fresh_swaps = [s for s in swaps if current_time - s['timestamp'] < 15]
+        
+        # Check if there are swaps with gas prices higher than our gas price
+        higher_gas_swaps = [s for s in fresh_swaps if s['gas_price'] > our_gas_price]
+        
+        if len(higher_gas_swaps) >= 2:
+            max_gas = max(s['gas_price'] for s in higher_gas_swaps) / 1e9
+            details = f"Detected {len(higher_gas_swaps)} pending front-run swaps. Max gas: {max_gas:.2f} Gwei."
+            return True, len(higher_gas_swaps), details
+            
+        return False, len(higher_gas_swaps), f"Found {len(fresh_swaps)} fresh pending swaps, not sandwiched."
 
     async def start(self):
         """Start monitoring mempool."""

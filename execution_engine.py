@@ -11,6 +11,7 @@ Advanced execution features:
 - Retry logic with increasing gas
 """
 
+import os
 from typing import Optional, Dict, Tuple, List
 from web3 import Web3
 from eth_utils import to_checksum_address
@@ -256,6 +257,19 @@ class ExecutionEngine:
         
         return fn
 
+    def send_raw_transaction_safe(self, raw_tx) -> bytes:
+        """Submit transaction privately via Flashbots/private RPC if configured, otherwise fall back to public RPC."""
+        flash_rpc = os.getenv("FLASHBOTS_RPC")
+        if self.use_flashbots and flash_rpc:
+            try:
+                masked_rpc = flash_rpc[:4] + "..." + flash_rpc[-4:] if len(flash_rpc) > 8 else "***"
+                logger.info(f"Routing swap transaction privately via: {masked_rpc}...")
+                private_w3 = Web3(Web3.HTTPProvider(flash_rpc))
+                return private_w3.eth.send_raw_transaction(raw_tx)
+            except Exception as e:
+                logger.warning(f"Private RPC submission failed: {e}. Falling back to public RPC...")
+        return self.w3.eth.send_raw_transaction(raw_tx)
+
     async def execute_swap(
         self,
         fn,
@@ -292,7 +306,7 @@ class ExecutionEngine:
                 
                 # Sign and send
                 signed = self.w3.eth.account.sign_transaction(tx, self.private_key)
-                tx_hash = self.w3.eth.send_raw_transaction(signed.rawTransaction)
+                tx_hash = self.send_raw_transaction_safe(signed.rawTransaction)
                 
                 logger.info(f"Swap sent: {tx_hash.hex()}")
                 return (True, "Swap executed", tx_hash.hex())

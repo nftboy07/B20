@@ -58,11 +58,18 @@ class EarlyDetectionEngine:
         """Handle mempool transaction detection."""
         logger.info(f"🔔 Mempool signal: {event_type}")
         
+        token_address = data.get('token_address')
+        if self.mempool_monitor and token_address:
+            is_sandwiched, _, details_str = self.mempool_monitor.is_token_sandwiched(token_address)
+            if is_sandwiched:
+                logger.warning(f"⚠️ Mempool token {token_address} is sandwiched: {details_str}")
+                data['mev_warning'] = details_str
+                
         signal = DetectionSignal(
             signal_type='mempool_pending',
-            token_address=data.get('token_address'),
+            token_address=token_address,
             pool_address=None,  # Not known until TX mines
-            confidence=0.7,  # Mempool TXs might fail
+            confidence=0.5 if 'mev_warning' in data else 0.7,  # Reduce confidence if sandwiched
             detected_at=time.time(),
             details=data
         )
@@ -149,6 +156,7 @@ class MultiSourceDetector:
         self.events = event_monitor
         self.db = db_manager
         self.early_detection = EarlyDetectionEngine(db_manager)
+        self.early_detection.mempool_monitor = mempool_monitor
         self.is_running = False
 
     def register_detection_callback(self, callback: Callable):

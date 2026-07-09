@@ -324,6 +324,8 @@ def now_utc() -> datetime:
 def is_activation_time_passed() -> bool:
     return now_utc() >= ACTIVATION_UTC
 
+mempool_monitor_instance = None
+
 def load_config() -> Dict[str, Any]:
     load_dotenv()
     cfg = {
@@ -438,6 +440,31 @@ def tg_send(message: str, reply_markup: dict = None) -> bool:
 
 def is_kill_switch_active(kill_file: str) -> bool:
     return os.path.exists(kill_file)
+
+private_w3 = None
+
+def get_private_w3() -> Optional[Web3]:
+    global private_w3
+    if private_w3 is not None:
+        return private_w3
+    flash_rpc = os.getenv("FLASHBOTS_RPC")
+    if flash_rpc:
+        try:
+            private_w3 = Web3(Web3.HTTPProvider(flash_rpc))
+            print(f"[PRIV] Initialized private RPC: {mask_sensitive(flash_rpc)}")
+        except Exception as e:
+            print(f"[PRIV] Failed to initialize private RPC: {e}")
+    return private_w3
+
+def send_raw_transaction_safe(w3: Web3, raw_tx) -> bytes:
+    p_w3 = get_private_w3()
+    if p_w3:
+        try:
+            print("Routing transaction privately via private RPC...")
+            return p_w3.eth.send_raw_transaction(raw_tx)
+        except Exception as e:
+            print(f"Private RPC submission failed: {e}. Falling back to public RPC...")
+    return w3.eth.send_raw_transaction(raw_tx)
 
 # Simple SQLite trade logger (major upgrade for analytics)
 DB_FILE = "b20_trades.db"
@@ -1130,13 +1157,7 @@ def create_b20_live(w3: Web3, variant: int, salt: bytes, params: bytes, init_cal
     print(f"Submitting createB20 (gas={gas}, maxFee={max_fee}) ...")
     signed = account.sign_transaction(tx)
     # Optionally route via Flashbots if user configured a private RPC
-    flash_rpc = os.getenv("FLASHBOTS_RPC")
-    if flash_rpc:
-        print("Using Flashbots/private RPC for submission if configured as provider.")
-        # Re-create provider or use send_raw_transaction on a flashbots w3 if desired.
-        # For simplicity we still use the main w3 here; user can start with FLASHBOTS as RPC_URL.
-
-    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+    tx_hash = send_raw_transaction_safe(w3, signed.raw_transaction)
     print("createB20 tx sent:", tx_hash.hex())
 
     receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
@@ -1262,6 +1283,22 @@ def attempt_buy(w3: Web3, token: str, fee: int, amount_eth: float, cfg: dict,
         print("Pool has zero liquidity after wait. Skipping.")
         return None
 
+    # MEV Sandwich / Front-run Protection Check
+    global mempool_monitor_instance
+    if mempool_monitor_instance:
+        base_fee = w3.eth.get_block("latest").get("baseFeePerGas", 0) or w3.eth.gas_price
+        est_max_gas = int(base_fee * 1.5) + w3.to_wei(3, "gwei")
+        is_sandwiched, count, details = mempool_monitor_instance.is_token_sandwiched(token, our_gas_price=est_max_gas)
+        if is_sandwiched:
+            print(f"⚠️ MEV Sandwich detected in mempool: {details}")
+            tg_send(f"⚠️ <b>MEV Sandwich Warning</b> for <code>{token}</code>:\n{details}\n<i>Waiting for pending txs to clear...</i>")
+            time.sleep(3)
+            is_sandwiched, count, details = mempool_monitor_instance.is_token_sandwiched(token, our_gas_price=est_max_gas)
+            if is_sandwiched:
+                print("Token is still heavily sandwiched. Skipping buy for safety.")
+                tg_send(f"🚫 <b>Buy Skipped</b>: Token <code>{token}</code> has active sandwich/front-run activity in the mempool.")
+                return None
+
     print(f"Pool {pool} liquidity: {liq}. Proceeding with buy attempt. (fee={fee})")
 
     amount_in = w3.to_wei(amount_eth, "ether")
@@ -1311,7 +1348,7 @@ def attempt_buy(w3: Web3, token: str, fee: int, amount_eth: float, cfg: dict,
                 except:
                     pass
 
-                tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+                tx_hash = send_raw_transaction_safe(w3, signed.raw_transaction)
                 print("Buy tx sent:", tx_hash.hex())
                 tg_send(f"💰 Buy tx sent for <code>{token}</code>\nAmount: {amount_eth} ETH\nTx: <code>{tx_hash.hex()}</code>")
                 receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=90)
@@ -1448,7 +1485,7 @@ def attempt_sell(w3: Web3, token: str, fee: int, amount_token: int, cfg: dict, m
     print(f"Sell attempt: amount_token={amount_token}")
     signed = account.sign_transaction(tx)
     try:
-        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+        tx_hash = send_raw_transaction_safe(w3, signed.raw_transaction)
         print("Sell tx sent:", tx_hash.hex())
         tg_send(f"💸 Sell tx sent for <code>{token}</code>\nTx: <code>{tx_hash.hex()}</code>")
         receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=90)
@@ -1744,6 +1781,8 @@ def main():
                     on_b20_detected=on_b20_mem,
                     on_pool_detected=lambda tx, txh, st: None
                 )
+                global mempool_monitor_instance
+                mempool_monitor_instance = mempool
                 # Run in background thread
                 mempool_thread = threading.Thread(target=lambda: asyncio.run(mempool.start()), daemon=True)
                 mempool_thread.start()
