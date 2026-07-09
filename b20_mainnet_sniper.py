@@ -80,7 +80,25 @@ except ImportError:
     MEMPOOL_AVAILABLE = False
     print("Mempool modules not available (optional)")
 
+import requests
+
 current_w3 = None
+
+# Persistent session for all Telegram Bot API calls.
+# Reuses TCP/TLS connections (keep-alive) -> much lower latency for getUpdates, sendMessage, answerCallbackQuery.
+# This directly fixes "TG buttons slow" and poll disconnects.
+tg_session = requests.Session()
+tg_session.headers.update({
+    "Connection": "keep-alive",
+    "User-Agent": "B20-Sniper/1.0"
+})
+# Connection pooling + small retries for TG API stability (helps against transient disconnects on long-poll)
+try:
+    from requests.adapters import HTTPAdapter
+    adapter = HTTPAdapter(pool_connections=2, pool_maxsize=4, max_retries=1)
+    tg_session.mount("https://api.telegram.org", adapter)
+except Exception:
+    pass  # non-fatal if adapter not usable
 
 # =============================================================================
 # MAINNET-ONLY CONSTANTS (DO NOT CHANGE)
@@ -329,13 +347,13 @@ def get_working_w3(rpc_list: list = None, max_attempts: int = 5) -> Web3:
 def tg_send(message: str, reply_markup: dict = None):
     """Send message to Telegram if TG_BOT_TOKEN and TG_USER_ID are set in .env.
     Supports optional inline keyboard buttons for commands.
+    Uses persistent session for speed.
     """
     token = os.getenv("TG_BOT_TOKEN")
     user_id = os.getenv("TG_USER_ID")
     if not token or not user_id:
         return
     try:
-        import requests
         url = f"https://api.telegram.org/bot{token}/sendMessage"
         payload = {
             "chat_id": user_id,
@@ -345,7 +363,7 @@ def tg_send(message: str, reply_markup: dict = None):
         }
         if reply_markup:
             payload["reply_markup"] = reply_markup
-        requests.post(url, json=payload, timeout=8)
+        tg_session.post(url, json=payload, timeout=8)
     except Exception as e:
         print(f"[TG] notify failed: {e}")
 
@@ -353,7 +371,8 @@ def check_tg_commands(cfg: dict, w3=None):
     """TG commands with inline buttons for control.
     Supports /start to show buttons, and callback buttons for pause/resume/status + buy buttons.
     Uses offset file to avoid reprocessing updates.
-    Runs in own thread for fast response.
+    Runs in own thread + persistent session + long-poll (timeout=20) for ~instant button response.
+    Heavy buy work is offloaded to background threads so the poll loop NEVER blocks.
     """
     token = cfg.get("TG_BOT_TOKEN", "")
     user_id = cfg.get("TG_USER_ID", "")
@@ -367,13 +386,26 @@ def check_tg_commands(cfg: dict, w3=None):
                 offset = int(f.read().strip() or 0)
         except:
             offset = 0
+
+    def _execute_buy(use_w3, tkn, amt, cfg):
+        """Run in separate thread so TG polling stays responsive."""
+        try:
+            tg_send(f"Executing buy {amt} ETH on {tkn}...")
+            f = 3000
+            p = find_or_wait_pool(use_w3, WETH, tkn, f) or find_or_wait_pool(use_w3, tkn, WETH, f)
+            if not p:
+                f = 10000
+            attempt_buy(use_w3, tkn, f, amt, cfg, max_retries=1)
+        except Exception as be:
+            tg_send(f"Buy button error: {be}")
+
     while True:
         try:
-            import requests
             # Long polling with high timeout for near-instant response when update arrives.
             # No extra sleep - loop immediately for next poll.
+            # Session keeps connection warm to avoid RemoteDisconnected / slow reconnects.
             url = f"https://api.telegram.org/bot{token}/getUpdates?offset={offset}&limit=10&timeout=20"
-            resp = requests.get(url, timeout=25).json()
+            resp = tg_session.get(url, timeout=25).json()
 
             if not resp.get("ok") or not resp.get("result"):
                 continue
@@ -387,7 +419,12 @@ def check_tg_commands(cfg: dict, w3=None):
                     cb = update["callback_query"]
                     data = cb.get("data", "")
                     cb_id = cb["id"]
-                    requests.post(f"https://api.telegram.org/bot{token}/answerCallbackQuery", json={"callback_query_id": cb_id})
+                    # Fast ack + use session + timeout
+                    tg_session.post(
+                        f"https://api.telegram.org/bot{token}/answerCallbackQuery",
+                        json={"callback_query_id": cb_id},
+                        timeout=5
+                    )
 
                     if data == "status":
                         tg_send("📊 Bot Status: LIVE mode active. Monitoring pools. Check logs.")
@@ -408,12 +445,13 @@ def check_tg_commands(cfg: dict, w3=None):
                             amt = float(amt_str)
                             use_w3 = w3 or current_w3
                             if use_w3:
-                                tg_send(f"Executing buy {amt} ETH on {tkn}...")
-                                f = 3000
-                                p = find_or_wait_pool(use_w3, WETH, tkn, f) or find_or_wait_pool(use_w3, tkn, WETH, f)
-                                if not p:
-                                    f = 10000
-                                attempt_buy(use_w3, tkn, f, amt, cfg, max_retries=1)
+                                # IMPORTANT: spawn thread. Do NOT block the long-poll loop with RPCs/tx/wait_receipt.
+                                # This is the main fix for "tg buttons fucking slow".
+                                threading.Thread(
+                                    target=_execute_buy,
+                                    args=(use_w3, tkn, amt, cfg),
+                                    daemon=True
+                                ).start()
                         except Exception as be:
                             tg_send(f"Buy button error: {be}")
 
@@ -446,8 +484,10 @@ def check_tg_commands(cfg: dict, w3=None):
                 f.write(str(new_offset))
             offset = new_offset
         except Exception as e:
+            # Transient network (RemoteDisconnected etc) during long-poll is common.
+            # Recover fast instead of 1s sleep so buttons feel instant.
             print(f"[TG] command poll error: {e}")
-            time.sleep(1)
+            time.sleep(0.3)
 
 def is_kill_switch_active(kill_file: str) -> bool:
     return os.path.exists(kill_file)
@@ -1052,7 +1092,7 @@ def monitor_new_pools_and_snipe(w3: Web3, buy_amount_eth: float = 0.05, cfg: dic
 
                 last_block = current_block
 
-            time.sleep(5)  # Increased sleep to reduce rate limits on public RPCs
+            time.sleep(3)  # Sleep to reduce rate limits; with paid RPC can be lower for faster detection
 
             # TG commands now in separate thread for speed (see below)
 
