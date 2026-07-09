@@ -234,19 +234,31 @@ UNISWAP_V3_POOL_ABI = [
     ], "stateMutability": "view", "type": "function"}
 ]
 
-# Uniswap V3 Router ABI (only the functions we need)
+# Uniswap V3 Router ABI (struct style for exactInputSingle)
 UNISWAP_V3_ROUTER_ABI = [
-    {"inputs": [
-        {"internalType": "address", "name": "tokenIn", "type": "address"},
-        {"internalType": "address", "name": "tokenOut", "type": "address"},
-        {"internalType": "uint24", "name": "fee", "type": "uint24"},
-        {"internalType": "address", "name": "recipient", "type": "address"},
-        {"internalType": "uint256", "name": "deadline", "type": "uint256"},
-        {"internalType": "uint256", "name": "amountIn", "type": "uint256"},
-        {"internalType": "uint256", "name": "amountOutMinimum", "type": "uint256"},
-        {"internalType": "uint160", "name": "sqrtPriceLimitX96", "type": "uint160"}
-    ], "name": "exactInputSingle", "outputs": [{"internalType": "uint256", "name": "amountOut", "type": "uint256"}],
-     "stateMutability": "payable", "type": "function"}
+    {
+        "inputs": [
+            {
+                "components": [
+                    {"internalType": "address", "name": "tokenIn", "type": "address"},
+                    {"internalType": "address", "name": "tokenOut", "type": "address"},
+                    {"internalType": "uint24", "name": "fee", "type": "uint24"},
+                    {"internalType": "address", "name": "recipient", "type": "address"},
+                    {"internalType": "uint256", "name": "deadline", "type": "uint256"},
+                    {"internalType": "uint256", "name": "amountIn", "type": "uint256"},
+                    {"internalType": "uint256", "name": "amountOutMinimum", "type": "uint256"},
+                    {"internalType": "uint160", "name": "sqrtPriceLimitX96", "type": "uint160"}
+                ],
+                "internalType": "struct ISwapRouter.ExactInputSingleParams",
+                "name": "params",
+                "type": "tuple"
+            }
+        ],
+        "name": "exactInputSingle",
+        "outputs": [{"internalType": "uint256", "name": "amountOut", "type": "uint256"}],
+        "stateMutability": "payable",
+        "type": "function"
+    }
 ]
 
 # Minimal QuoterV2 ABI for accurate quotes (upgrade for real slippage)
@@ -854,6 +866,14 @@ def find_or_wait_pool(w3: Web3, token_a: str, token_b: str, fee: int) -> Optiona
         return to_checksum_address(pool)
     return None
 
+def find_best_pool(w3: Web3, token: str) -> tuple[Optional[str], Optional[int]]:
+    """Try common fees to find a pool for the token (upgrade for reliable buys)."""
+    for fee in [3000, 10000, 500]:  # common fees, prioritize 3000
+        pool = find_or_wait_pool(w3, WETH, token, fee) or find_or_wait_pool(w3, token, WETH, fee)
+        if pool:
+            return pool, fee
+    return None, None
+
 def find_aerodrome_pool(w3: Web3, token_a: str, token_b: str) -> Optional[str]:
     """Aerodrome support stub (upgrade #11). Currently falls back to Uniswap."""
     return None
@@ -911,17 +931,26 @@ def attempt_buy(w3: Web3, token: str, fee: int, amount_eth: float, cfg: dict,
     account = w3.eth.account.from_key(os.getenv("PRIVATE_KEY"))
     sender = account.address
 
-    pool = find_or_wait_pool(w3, WETH, token, fee) or find_or_wait_pool(w3, token, WETH, fee)
+    # Use best pool finder for reliability
+    pool, actual_fee = find_best_pool(w3, token)
     if not pool:
         print("No pool found for token yet.")
         return None
+    if actual_fee is not None:
+        fee = actual_fee  # use the one that exists
 
-    liq = check_pool_liquidity(w3, pool)
-    if liq == 0:
-        print("Pool has zero liquidity. Skipping.")
+    # Wait a bit for liquidity if it's zero (common right after pool create)
+    for _ in range(5):  # up to ~5-10s wait
+        liq = check_pool_liquidity(w3, pool)
+        if liq > 0:
+            break
+        print("Pool liq still 0, waiting briefly...")
+        time.sleep(1)
+    else:
+        print("Pool has zero liquidity after wait. Skipping.")
         return None
 
-    print(f"Pool {pool} liquidity: {liq}. Proceeding with buy attempt.")
+    print(f"Pool {pool} liquidity: {liq}. Proceeding with buy attempt. (fee={fee})")
 
     amount_in = w3.to_wei(amount_eth, "ether")
 

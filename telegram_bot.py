@@ -24,6 +24,7 @@ from telegram.ext import (
     CallbackQueryHandler,
     ContextTypes,
 )
+from telegram.error import InvalidToken
 
 load_dotenv()
 
@@ -224,9 +225,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                 def _do_buy():
                     try:
-                        f = 3000
-                        # We let the main sniper's buy logic handle pool finding
-                        _buy_callback(use_w3, tkn, f, amt, _cfg)
+                        # Let attempt_buy find best fee/pool (improved)
+                        _buy_callback(use_w3, tkn, 3000, amt, _cfg)
                     except Exception as be:
                         # The main code already does tg_send on errors
                         print(f"[TG BUY] background error: {be}")
@@ -268,6 +268,7 @@ def start_telegram_bot_in_background() -> threading.Thread:
     """
     Starts the interactive bot using python-telegram-bot in a daemon thread.
     This replaces the old raw getUpdates long-poll thread.
+    Gracefully handles invalid token (e.g. example placeholder).
     """
     token = _get_token()
     if not token:
@@ -276,7 +277,11 @@ def start_telegram_bot_in_background() -> threading.Thread:
 
     def _runner():
         async def _run():
-            app = _build_application(token)
+            try:
+                app = _build_application(token)
+            except InvalidToken as e:
+                print(f"[TG] Invalid token (replace example with real from @BotFather): {e}")
+                return
             # Clean webhook like ethbot diag
             try:
                 await app.bot.delete_webhook(drop_pending_updates=True)
