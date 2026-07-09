@@ -1,124 +1,215 @@
 #!/usr/bin/env python3
 """
-Early Detection Engine
-Combines signals from mempool and blockchain for early B20 meme detection.
-
-Provides confidence scoring and lead time calculation.
+Early Detection Engine - Combines Mempool + Event Monitoring
+=============================================================
+Detects B20 pools via multiple signals:
+1. Mempool TX monitoring (5-30s before mining)
+2. Blockchain event listening (after mining)
+3. Gas price analysis for optimal entry timing
 """
 
 import asyncio
 import time
-from datetime import datetime
-from typing import Callable, Dict, List, Optional
-from collections import deque
 import logging
+import threading
+from datetime import datetime, timezone
+from typing import Dict, Callable, Optional, List, Set
+from dataclasses import dataclass
+
+from eth_utils import to_checksum_address
 
 logger = logging.getLogger(__name__)
 
-class EarlyDetectionEngine:
-    def __init__(self, on_detection: Optional[Callable] = None):
-        self.on_detection = on_detection
-        self.mempool_signals = deque(maxlen=100)
-        self.blockchain_signals = deque(maxlen=100)
-        self.stats = {
-            "total_signals": 0,
-            "b20_detections": 0,
-            "avg_lead_time": 0,
-            "false_positives": 0,
-            "confidence_scores": []
-        }
-        self.callbacks = []
-        if on_detection:
-            self.callbacks.append(on_detection)
 
-    def add_callback(self, callback: Callable):
+@dataclass
+class DetectionSignal:
+    """Early detection signal."""
+    signal_type: str  # 'mempool_pending' | 'event_mined' | 'gas_spike'
+    token_address: Optional[str]
+    pool_address: Optional[str]
+    confidence: float  # 0-1
+    detected_at: float  # Unix timestamp
+    details: Dict
+
+
+class EarlyDetectionEngine:
+    """Combines multiple detection signals for earliest pool detection."""
+
+    def __init__(self, db_manager=None):
+        self.db = db_manager
+        self.mempool_monitor = None
+        self.event_monitor = None
+        self.detection_signals: List[DetectionSignal] = []
+        self.callbacks: List[Callable] = []
+        self.is_running = False
+        self.stats = {
+            'mempool_detections': 0,
+            'event_detections': 0,
+            'avg_mempool_lead_time': 0,
+            'false_positives': 0,
+            'confirmed_pools': 0,
+        }
+
+    def register_callback(self, callback: Callable):
+        """Register callback for when pool is detected."""
         self.callbacks.append(callback)
 
-    async def process_mempool_signal(self, tx: dict, tx_hash: str, signal_type: str):
-        """Process signal from mempool monitor."""
-        signal = {
-            "source": "mempool",
-            "tx": tx_hash,
-            "type": signal_type,
-            "timestamp": time.time(),
-            "gas_price": tx.get("gasPrice", 0),
-            "from": tx.get("from"),
-            "to": tx.get("to")
+    async def on_mempool_tx(self, event_type: str, data: Dict):
+        """Handle mempool transaction detection."""
+        logger.info(f"🔔 Mempool signal: {event_type}")
+        
+        signal = DetectionSignal(
+            signal_type='mempool_pending',
+            token_address=data.get('token_address'),
+            pool_address=None,  # Not known until TX mines
+            confidence=0.7,  # Mempool TXs might fail
+            detected_at=time.time(),
+            details=data
+        )
+        
+        self.detection_signals.append(signal)
+        self.stats['mempool_detections'] += 1
+        
+        # Notify immediately (high confidence mempool TX)
+        await self._notify_detection(signal)
+
+    async def on_pool_created(self, event_type: str, data: Dict):
+        """Handle blockchain pool creation event."""
+        pool_addr = data.get('pool_address')
+        logger.info(f"✅ Pool created on-chain: {pool_addr[:8]}...")
+        
+        # Check if we detected this in mempool first
+        mempool_signal = None
+        for sig in self.detection_signals:
+            if sig.signal_type == 'mempool_pending' and sig.pool_address == pool_addr:
+                mempool_signal = sig
+                break
+        
+        signal = DetectionSignal(
+            signal_type='event_mined',
+            token_address=data.get('token_address'),
+            pool_address=pool_addr,
+            confidence=1.0,  # Confirmed on-chain
+            detected_at=time.time(),
+            details=data
+        )
+        
+        # Calculate mempool lead time
+        if mempool_signal:
+            lead_time = signal.detected_at - mempool_signal.detected_at
+            logger.info(f"⏱️  Mempool lead time: {lead_time:.2f} seconds")
+            self._update_avg_lead_time(lead_time)
+        
+        self.detection_signals.append(signal)
+        self.stats['event_detections'] += 1
+        self.stats['confirmed_pools'] += 1
+        
+        # Notify
+        await self._notify_detection(signal)
+
+    async def _notify_detection(self, signal: DetectionSignal):
+        """Notify all callbacks of detection."""
+        for callback in self.callbacks:
+            try:
+                await callback('pool_detected', {
+                    'signal_type': signal.signal_type,
+                    'token': signal.token_address,
+                    'pool': signal.pool_address,
+                    'confidence': signal.confidence,
+                    'timestamp': datetime.fromtimestamp(signal.detected_at).isoformat(),
+                    'details': signal.details,
+                })
+            except Exception as e:
+                logger.error(f"Callback error: {e}")
+
+    def _update_avg_lead_time(self, lead_time: float):
+        """Update average mempool lead time."""
+        if self.stats['mempool_detections'] == 0:
+            self.stats['avg_mempool_lead_time'] = lead_time
+        else:
+            current_avg = self.stats['avg_mempool_lead_time']
+            new_count = self.stats['mempool_detections']
+            self.stats['avg_mempool_lead_time'] = (
+                (current_avg * (new_count - 1) + lead_time) / new_count
+            )
+
+    def get_stats(self) -> Dict:
+        """Get detection statistics."""
+        return {
+            **self.stats,
+            'total_signals': len(self.detection_signals),
         }
-        self.mempool_signals.append(signal)
-        self.stats["total_signals"] += 1
 
-        # Combine with blockchain signals for confidence
-        confidence = self._calculate_confidence(signal)
-        lead_time = self._estimate_lead_time(signal)
 
-        detection = {
-            "signal": signal,
-            "confidence": confidence,
-            "estimated_lead_time": lead_time,
-            "timestamp": datetime.utcnow().isoformat()
+class MultiSourceDetector:
+    """High-level detector combining mempool + events + gas trends."""
+
+    def __init__(self, mempool_monitor, event_monitor, db_manager=None):
+        self.mempool = mempool_monitor
+        self.events = event_monitor
+        self.db = db_manager
+        self.early_detection = EarlyDetectionEngine(db_manager)
+        self.is_running = False
+
+    def register_detection_callback(self, callback: Callable):
+        """Register callback for when pool is detected."""
+        self.early_detection.register_callback(callback)
+
+    async def start(self):
+        """Start all detection sources."""
+        logger.info("🚀 Starting multi-source detection engine...")
+        self.is_running = True
+        
+        # Register callbacks
+        self.mempool.register_callback(self.early_detection.on_mempool_tx)
+        self.events.register_callback(self.early_detection.on_pool_created)
+        
+        # Start both monitors
+        mempool_task = asyncio.create_task(self.mempool.start())
+        events_task = asyncio.create_task(
+            self.events.listen_pool_created(self.early_detection.on_pool_created)
+        )
+        
+        await asyncio.gather(mempool_task, events_task)
+
+    def stop(self):
+        """Stop detection."""
+        logger.info("⏹ Stopping multi-source detector...")
+        self.is_running = False
+        self.mempool.stop()
+
+    def get_stats(self) -> Dict:
+        """Get overall statistics."""
+        return {
+            'is_running': self.is_running,
+            'detection_engine': self.early_detection.get_stats(),
+            'mempool_monitor': self.mempool.get_stats() if self.mempool else {},
         }
 
-        if confidence > 0.6:  # Threshold
-            self.stats["b20_detections"] += 1
-            self.stats["confidence_scores"].append(confidence)
-            if lead_time:
-                self.stats["avg_lead_time"] = (self.stats["avg_lead_time"] * (len(self.stats["confidence_scores"])-1) + lead_time) / len(self.stats["confidence_scores"])
 
-            logger.info(f"Early detection: {tx_hash} confidence={confidence:.2f} lead={lead_time}s")
-            for cb in self.callbacks:
-                try:
-                    await cb(detection) if asyncio.iscoroutinefunction(cb) else cb(detection)
-                except Exception as e:
-                    logger.error(f"Callback error: {e}")
-
-    async def process_blockchain_signal(self, event: dict, signal_type: str):
-        """Process signal from blockchain events (e.g. from main monitor)."""
-        signal = {
-            "source": "blockchain",
-            "tx": event.get("transactionHash"),
-            "type": signal_type,
-            "timestamp": time.time(),
-            "block": event.get("blockNumber"),
-            "data": str(event)[:100]
-        }
-        self.blockchain_signals.append(signal)
-        self.stats["total_signals"] += 1
-
-        # Lower confidence for blockchain only
-        confidence = 0.4
-        self.stats["confidence_scores"].append(confidence)
-
-    def _calculate_confidence(self, mempool_signal: dict) -> float:
-        """Simple confidence based on gas, type, etc."""
-        base = 0.5
-        if mempool_signal["type"] == "b20_creation":
-            base += 0.3
-        if mempool_signal.get("gas_price", 0) > 1000000000:  # high gas
-            base += 0.1
-        # More heuristics...
-        return min(1.0, base)
-
-    def _estimate_lead_time(self, signal: dict) -> Optional[float]:
-        """Estimate seconds until mined based on gas price etc."""
-        # Very rough: higher gas = faster
-        gas = signal.get("gas_price", 0)
-        if gas > 2000000000:
-            return 5.0
-        elif gas > 1000000000:
-            return 15.0
-        return 25.0
-
-    def get_stats(self) -> dict:
-        if self.stats["confidence_scores"]:
-            self.stats["avg_confidence"] = sum(self.stats["confidence_scores"]) / len(self.stats["confidence_scores"])
-        return self.stats.copy()
-
-# Example integration
-if __name__ == "__main__":
-    async def on_early_detect(detection):
-        print(f"EARLY DETECT: {detection}")
-
-    engine = EarlyDetectionEngine(on_early_detect)
-    # Would be called from mempool_monitor
-    print("Early detection engine ready")
+if __name__ == '__main__':
+    """Test the detection engine."""
+    logging.basicConfig(level=logging.INFO)
+    
+    async def test_callback(event_type: str, data: Dict):
+        logger.info(f"Detection callback: {event_type} - {data}")
+    
+    async def main():
+        from mempool_monitor import MempoolMonitor
+        from event_monitor import EventMonitor
+        
+        mempool = MempoolMonitor()
+        events = EventMonitor(None, None, None, None)
+        
+        detector = MultiSourceDetector(mempool, events)
+        detector.register_detection_callback(test_callback)
+        
+        try:
+            await detector.start()
+        except KeyboardInterrupt:
+            detector.stop()
+    
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Interrupted")

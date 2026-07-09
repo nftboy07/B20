@@ -1,0 +1,416 @@
+#!/usr/bin/env python3
+"""
+Safety Analyzer for B20 Bot
+===========================
+Comprehensive token and pool safety analysis:
+- Honeypot detection
+- Mint authority checks
+- Holder distribution analysis
+- Buy/sell tax detection
+- Safety score calculation (0-100)
+- Rug probability estimation
+"""
+
+from typing import Dict, Optional, Tuple, List
+from web3 import Web3
+from eth_utils import to_checksum_address
+from eth_abi import decode
+import json
+
+
+class SafetyAnalyzer:
+    """Multi-vector safety analysis for B20 tokens and pools."""
+
+    # Token ABI for basic checks
+    TOKEN_ABI = [
+        {
+            "inputs": [],
+            "name": "totalSupply",
+            "outputs": [{"type": "uint256"}],
+            "type": "function",
+            "stateMutability": "view"
+        },
+        {
+            "inputs": [{"type": "address"}],
+            "name": "balanceOf",
+            "outputs": [{"type": "uint256"}],
+            "type": "function",
+            "stateMutability": "view"
+        },
+        {
+            "inputs": [],
+            "name": "decimals",
+            "outputs": [{"type": "uint8"}],
+            "type": "function",
+            "stateMutability": "view"
+        },
+        {
+            "inputs": [{"type": "address"}],
+            "name": "minter",
+            "outputs": [{"type": "address"}],
+            "type": "function",
+            "stateMutability": "view"
+        },
+        {
+            "inputs": [],
+            "name": "owner",
+            "outputs": [{"type": "address"}],
+            "type": "function",
+            "stateMutability": "view"
+        }
+    ]
+
+    # Pool ABI for liquidity checks
+    POOL_ABI = [
+        {
+            "inputs": [],
+            "name": "liquidity",
+            "outputs": [{"type": "uint128"}],
+            "type": "function",
+            "stateMutability": "view"
+        },
+        {
+            "inputs": [],
+            "name": "slot0",
+            "outputs": [
+                {"type": "uint160"},  # sqrtPriceX96
+                {"type": "int24"},    # tick
+                {"type": "uint16"},   # observationIndex
+                {"type": "uint16"},   # observationCardinality
+                {"type": "uint16"},   # observationCardinalityNext
+                {"type": "uint8"},    # feeProtocol
+                {"type": "bool"}      # unlocked
+            ],
+            "type": "function",
+            "stateMutability": "view"
+        }
+    ]
+
+    QUOTER_V2_ABI = [
+        {
+            "inputs": [{"type": "bytes"}],
+            "name": "quoteExactInputSingle",
+            "outputs": [
+                {"type": "uint256"},  # amountOut
+                {"type": "uint160"},  # sqrtPriceX96After
+                {"type": "uint32"},   # initializedTicksCrossed
+                {"type": "uint256"}   # gasEstimate
+            ],
+            "type": "function",
+            "stateMutability": "nonpayable"
+        }
+    ]
+
+    ROUTER_ABI = [
+        {
+            "inputs": [
+                {"type": "address"},  # tokenIn
+                {"type": "address"},  # tokenOut
+                {"type": "uint24"},   # fee
+                {"type": "address"},  # recipient
+                {"type": "uint256"},  # deadline
+                {"type": "uint256"},  # amountIn
+                {"type": "uint256"},  # amountOutMinimum
+                {"type": "uint160"}   # sqrtPriceLimitX96
+            ],
+            "name": "exactInputSingle",
+            "outputs": [{"type": "uint256"}],
+            "type": "function",
+            "stateMutability": "payable"
+        }
+    ]
+
+    def __init__(self, w3: Web3, quoter_v2: str, router: str, weth: str):
+        self.w3 = w3
+        self.quoter_v2 = to_checksum_address(quoter_v2)
+        self.router = to_checksum_address(router)
+        self.weth = to_checksum_address(weth)
+
+    # =========== HONEYPOT DETECTION ===========
+    def detect_honeypot_via_simulation(
+        self, token_address: str, pool_address: str, buy_amount_eth: float = 0.001
+    ) -> Tuple[bool, float, str]:
+        """
+        Detect honeypot via full roundtrip simulation:
+        1. Buy token with WETH
+        2. Sell token back to WETH
+        3. Compare input vs output
+        Returns: (is_honeypot, loss_percent, reason)
+        """
+        try:
+            token = to_checksum_address(token_address)
+            
+            # Step 1: Get buy quote (WETH -> Token)
+            buy_amount_wei = self.w3.to_wei(buy_amount_eth, "ether")
+            
+            try:
+                buy_quote = self._get_exact_input_quote(
+                    self.weth, token, 3000, buy_amount_wei
+                )
+                if not buy_quote or buy_quote < 1:
+                    return (True, 100.0, "Buy quote failed or returned 0")
+            except Exception as e:
+                return (True, 100.0, f"Buy simulation failed: {str(e)[:50]}")
+
+            # Step 2: Try to sell token back to WETH
+            try:
+                sell_quote = self._get_exact_input_quote(
+                    token, self.weth, 3000, buy_quote
+                )
+                if not sell_quote or sell_quote == 0:
+                    return (True, 100.0, "Sell quote returned 0 (classic honeypot)")
+            except Exception as e:
+                return (True, 100.0, f"Sell simulation failed: {str(e)[:50]}")
+
+            # Step 3: Calculate loss
+            loss_percent = ((buy_amount_wei - sell_quote) / buy_amount_wei) * 100 if buy_amount_wei > 0 else 0
+            
+            # Threshold: >30% loss = likely honeypot
+            is_honeypot = loss_percent > 30
+            
+            return (is_honeypot, loss_percent, f"Roundtrip loss: {loss_percent:.2f}%")
+
+        except Exception as e:
+            return (False, 0.0, f"Honeypot check error: {str(e)[:50]}")
+
+    def _get_exact_input_quote(self, token_in: str, token_out: str, fee: int, amount_in: int) -> int:
+        """Get quote from QuoterV2."""
+        try:
+            quoter = self.w3.eth.contract(address=self.quoter_v2, abi=self.QUOTER_V2_ABI)
+            
+            # Encode params for quoteExactInputSingle
+            params = self.w3.codec.encode(
+                ['address', 'address', 'uint24', 'uint256', 'uint160'],
+                [to_checksum_address(token_in), to_checksum_address(token_out), fee, amount_in, 0]
+            )
+            
+            result = quoter.functions.quoteExactInputSingle(params).call()
+            return result[0]  # amountOut
+        except Exception as e:
+            print(f"Quote error: {e}")
+            return 0
+
+    # =========== MINT AUTHORITY ===========
+    def check_mint_authority(self, token_address: str) -> Tuple[int, str]:
+        """
+        Check if token can be minted post-creation.
+        Returns: (score 0-100, reason)
+        """
+        try:
+            token = self.w3.eth.contract(address=to_checksum_address(token_address), abi=self.TOKEN_ABI)
+            
+            # Try to get minter address (custom)
+            try:
+                minter = token.functions.minter().call()
+                if minter and minter != "0x0000000000000000000000000000000000000000":
+                    return (20, f"Has minter: {minter[:6]}... - CAN MINT")
+            except:
+                pass
+            
+            # Try to get owner (can usually mint if owner)
+            try:
+                owner = token.functions.owner().call()
+                if owner and owner != "0x0000000000000000000000000000000000000000":
+                    return (50, f"Has owner: {owner[:6]}... - May be able to mint")
+            except:
+                pass
+            
+            # No minter/owner found = likely immutable (good)
+            return (90, "No mint authority found (immutable)")
+        
+        except Exception as e:
+            return (0, f"Could not check mint authority: {str(e)[:50]}")
+
+    # =========== HOLDER DISTRIBUTION ===========
+    def analyze_holder_distribution(
+        self, token_address: str, top_holders_count: int = 10
+    ) -> Tuple[int, float, List[Tuple[str, float]]]:
+        """
+        Analyze token holder distribution.
+        Returns: (score, top10_percent, [(holder_address, percent), ...])
+        """
+        try:
+            token = self.w3.eth.contract(address=to_checksum_address(token_address), abi=self.TOKEN_ABI)
+            
+            # Get total supply
+            total_supply = token.functions.totalSupply().call()
+            if total_supply == 0:
+                return (0, 100.0, [])
+            
+            # Simulate top holders (in real implementation, need to scan events)
+            # For now, check dev wallet and known addresses
+            holders = []
+            dev_addresses = [
+                "0x0000000000000000000000000000000000000000",  # Burn
+                # Add other known addresses to check
+            ]
+            
+            top10_total = 0.0
+            for addr in dev_addresses:
+                try:
+                    balance = token.functions.balanceOf(to_checksum_address(addr)).call()
+                    percent = (balance / total_supply * 100) if total_supply > 0 else 0
+                    if percent > 0:
+                        holders.append((addr[:10], percent))
+                        top10_total += percent
+                except:
+                    pass
+            
+            # Score logic: <30% in top 10 = good
+            score = 100 - int(min(top10_total, 100))
+            if top10_total > 50:
+                score = 20  # Red flag
+            elif top10_total > 30:
+                score = 50
+            
+            return (score, top10_total, holders)
+        
+        except Exception as e:
+            return (0, 0.0, [(str(e)[:30], 0.0)])
+
+    # =========== BUY/SELL TAX ===========
+    def detect_buy_sell_tax(
+        self, token_address: str, pool_address: str, test_amount_eth: float = 0.001
+    ) -> Tuple[int, float, float, str]:
+        """
+        Detect buy and sell taxes.
+        Returns: (score, buy_tax_percent, sell_tax_percent, reason)
+        """
+        try:
+            # Simulate buy
+            buy_amount_wei = self.w3.to_wei(test_amount_eth, "ether")
+            buy_quote = self._get_exact_input_quote(
+                self.weth, to_checksum_address(token_address), 3000, buy_amount_wei
+            )
+            
+            # Simulate sell
+            if buy_quote > 0:
+                sell_quote = self._get_exact_input_quote(
+                    to_checksum_address(token_address), self.weth, 3000, buy_quote
+                )
+            else:
+                sell_quote = 0
+            
+            # Calculate implied tax
+            # Formula: tax% = 100 - (final / initial) * 100
+            if buy_amount_wei > 0 and sell_quote > 0:
+                roundtrip_percent = (sell_quote / buy_amount_wei) * 100
+                implied_tax = 100 - roundtrip_percent
+            else:
+                implied_tax = 100.0  # Assume max tax if quote fails
+            
+            # Score: <3% tax is normal (fees), >10% is suspicious
+            if implied_tax <= 3:
+                score = 95
+            elif implied_tax <= 10:
+                score = 70
+            else:
+                score = 30
+            
+            return (score, 0.0, implied_tax, f"Implied tax: {implied_tax:.2f}%")
+        
+        except Exception as e:
+            return (0, 0.0, 0.0, f"Tax check failed: {str(e)[:50]}")
+
+    # =========== LIQUIDITY CHECK ===========
+    def check_liquidity(self, pool_address: str, min_liquidity_eth: float = 5.0) -> Tuple[int, float, str]:
+        """
+        Check pool liquidity.
+        Returns: (score, liquidity_eth, reason)
+        """
+        try:
+            pool = self.w3.eth.contract(address=to_checksum_address(pool_address), abi=self.POOL_ABI)
+            liquidity = pool.functions.liquidity().call()
+            slot0 = pool.functions.slot0().call()
+            
+            sqrtPriceX96 = slot0[0]
+            
+            # Rough conversion to ETH equivalent (simplified)
+            # Real calculation would use decimals and price
+            liquidity_eth = liquidity / 1e18 if liquidity > 0 else 0
+            
+            if liquidity_eth < min_liquidity_eth:
+                return (40, liquidity_eth, f"Low liquidity: {liquidity_eth:.4f} ETH < {min_liquidity_eth} ETH")
+            elif liquidity_eth < min_liquidity_eth * 2:
+                return (70, liquidity_eth, f"Moderate liquidity: {liquidity_eth:.4f} ETH")
+            else:
+                return (95, liquidity_eth, f"Good liquidity: {liquidity_eth:.4f} ETH")
+        
+        except Exception as e:
+            return (0, 0.0, f"Liquidity check failed: {str(e)[:50]}")
+
+    # =========== SAFETY SCORE ===========
+    def calculate_safety_score(
+        self, token_address: str, pool_address: str, min_liquidity_eth: float = 5.0
+    ) -> Dict[str, any]:
+        """
+        Calculate comprehensive safety score (0-100).
+        Returns detailed breakdown of all checks.
+        """
+        scores = {}
+        
+        # Check 1: Honeypot
+        is_honeypot, loss_pct, honeypot_reason = self.detect_honeypot_via_simulation(
+            token_address, pool_address
+        )
+        scores['honeypot_score'] = 0 if is_honeypot else 95
+        scores['honeypot_reason'] = honeypot_reason
+        
+        # Check 2: Mint authority
+        mint_score, mint_reason = self.check_mint_authority(token_address)
+        scores['mint_authority_score'] = mint_score
+        scores['mint_reason'] = mint_reason
+        
+        # Check 3: Holder distribution
+        holder_score, top10_pct, holders = self.analyze_holder_distribution(token_address)
+        scores['holder_distribution_score'] = holder_score
+        scores['holder_reason'] = f"Top 10 holders: {top10_pct:.2f}%"
+        
+        # Check 4: Buy/Sell tax
+        tax_score, buy_tax, sell_tax, tax_reason = self.detect_buy_sell_tax(
+            token_address, pool_address
+        )
+        scores['tax_score'] = tax_score
+        scores['tax_reason'] = tax_reason
+        
+        # Check 5: Liquidity
+        liq_score, liq_eth, liq_reason = self.check_liquidity(pool_address, min_liquidity_eth)
+        scores['liquidity_score'] = liq_score
+        scores['liquidity_reason'] = liq_reason
+        scores['liquidity_eth'] = liq_eth
+        
+        # Rug probability (inverse of mint + holder checks)
+        rug_probability = 100 - max(scores['mint_authority_score'], scores['holder_distribution_score'])
+        scores['rug_probability_score'] = min(rug_probability, 100)
+        
+        # Overall score (weighted average)
+        weights = {
+            'honeypot_score': 0.25,
+            'mint_authority_score': 0.20,
+            'holder_distribution_score': 0.20,
+            'tax_score': 0.15,
+            'liquidity_score': 0.20
+        }
+        
+        overall = sum(scores[k] * v for k, v in weights.items())
+        scores['overall_score'] = int(overall)
+        
+        return scores
+
+    def should_buy(self, safety_scores: Dict, min_safety_score: int = 75) -> Tuple[bool, str]:
+        """
+        Determine if token passes safety threshold.
+        Returns: (should_buy, reason)
+        """
+        overall = safety_scores.get('overall_score', 0)
+        
+        if overall < min_safety_score:
+            return (False, f"Safety score {overall} < {min_safety_score}")
+        
+        if safety_scores.get('honeypot_score', 0) < 50:
+            return (False, "Likely honeypot")
+        
+        if safety_scores.get('rug_probability_score', 0) > 70:
+            return (False, "High rug probability")
+        
+        return (True, f"Passed all checks (score: {overall})")
