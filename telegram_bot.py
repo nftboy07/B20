@@ -81,6 +81,16 @@ def _get_senders(w3) -> list[str]:
         pass
     return []
 
+def _get_w3():
+    try:
+        from b20_mainnet_sniper import get_best_w3
+        rpcs = _cfg.get("BACKUP_RPCS") if _cfg else None
+        return get_best_w3(rpcs)
+    except Exception as e:
+        print(f"[TG] Failed to get rotating w3: {e}")
+        return _current_w3
+
+
 import time
 
 # Short TTL cache to speed up repeated menu button presses while keeping data fresh/real
@@ -165,7 +175,7 @@ Use /profit <token> or /balance + /price to check profitability yourself."""
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Enhanced status with real mainnet outputs: addr, ETH bal, buys, winrate, opens
     status_msg = "📊 Bot Status: LIVE mode active.\nMonitoring pools + B20Factory.\nTG interactive + buttons ready.\n"
-    use_w3 = _current_w3
+    use_w3 = _get_w3()
     try:
         from b20_mainnet_sniper import get_bot_address, get_open_positions, get_win_rate
         addr = get_bot_address()
@@ -229,7 +239,7 @@ async def sell_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     token = args[0]
     pct = 100 if len(args) < 2 or args[1].lower() == "all" else float(args[1])
     await update.message.reply_text(f"🔔 Sell request for {pct}% of {token} received. Computing real held balance...")
-    use_w3 = _current_w3
+    use_w3 = _get_w3()
     if _sell_callback and use_w3 and _cfg:
         def _do_sell():
             try:
@@ -260,7 +270,7 @@ async def positions_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Real mainnet positions: DB spent + on-chain held balance + PnL using live price
     try:
         from b20_mainnet_sniper import get_open_positions, get_bot_address
-        use_w3 = _current_w3
+        use_w3 = _get_w3()
         opens = await asyncio.to_thread(get_open_positions, use_w3)
         sender = get_bot_address()
         if not opens:
@@ -318,10 +328,10 @@ async def buy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     token, amt = args[0], float(args[1])
     msg = await update.message.reply_text(f"🛒 Buying {amt} ETH of <code>{token}</code>...\n<i>You will receive live updates in chat.</i>", parse_mode="HTML")
-    if _buy_callback and _current_w3 and _cfg:
+    if _buy_callback and _get_w3() and _cfg:
         def _manual_buy():
             try:
-                result = _buy_callback(_current_w3, token, 3000, amt, _cfg, force=True)
+                result = _buy_callback(_get_w3(), token, 3000, amt, _cfg, force=True)
                 if not result:
                     # tg_send already reported the reason; no extra message needed
                     pass
@@ -335,7 +345,7 @@ async def buy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Real mainnet balance: /balance [<token>]  (no arg = ETH balance)
     args = context.args or []
-    use_w3 = _current_w3
+    use_w3 = _get_w3()
     if not use_w3:
         await update.message.reply_text("No w3 context.")
         return
@@ -389,7 +399,7 @@ async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def address_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show bot's wallet address (the one used for positions and balances)."""
-    use_w3 = _current_w3
+    use_w3 = _get_w3()
     if use_w3:
         try:
             from b20_mainnet_sniper import get_bot_address
@@ -407,7 +417,7 @@ async def price_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /price <token>")
         return
     token = args[0]
-    use_w3 = _current_w3
+    use_w3 = _get_w3()
     if use_w3:
         try:
             from b20_mainnet_sniper import get_token_price_in_eth, get_token_decimals
@@ -432,7 +442,7 @@ async def token_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /token <token>")
         return
     token = args[0]
-    use_w3 = _current_w3
+    use_w3 = _get_w3()
     if use_w3:
         try:
             def _query_token_info():
@@ -456,7 +466,7 @@ async def token_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def ethbalance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Real mainnet ETH balance of all bot wallets."""
-    use_w3 = _current_w3
+    use_w3 = _get_w3()
     if not use_w3:
         await update.message.reply_text("No w3 context.")
         return
@@ -529,7 +539,7 @@ async def pools_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /pools <token>")
         return
     token = args[0]
-    use_w3 = _current_w3
+    use_w3 = _get_w3()
     if not use_w3:
         await update.message.reply_text("No w3 context.")
         return
@@ -559,7 +569,7 @@ async def tx_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /tx <0xhash>")
         return
     txh = args[0]
-    use_w3 = _current_w3
+    use_w3 = _get_w3()
     if not use_w3:
         await update.message.reply_text("No w3 context.")
         return
@@ -593,7 +603,7 @@ async def export_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def pnl_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Overall real mainnet PnL summary."""
-    use_w3 = _current_w3
+    use_w3 = _get_w3()
     try:
         from b20_mainnet_sniper import get_total_spent, get_estimated_portfolio_value, get_open_positions, get_win_rate, get_bot_address
         def _get_pnl():
@@ -627,7 +637,7 @@ async def spent_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def value_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Current estimated portfolio value from live prices."""
-    use_w3 = _current_w3
+    use_w3 = _get_w3()
     try:
         from b20_mainnet_sniper import get_estimated_portfolio_value
         val = await asyncio.to_thread(get_estimated_portfolio_value, use_w3)
@@ -638,7 +648,7 @@ async def value_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def gas_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Real mainnet gas prices."""
-    use_w3 = _current_w3
+    use_w3 = _get_w3()
     if not use_w3:
         await update.message.reply_text("No w3 context.")
         return
@@ -656,7 +666,7 @@ async def safety_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /safety <token>")
         return
     token = args[0]
-    use_w3 = _current_w3
+    use_w3 = _get_w3()
     if not use_w3:
         await update.message.reply_text("No w3 context.")
         return
@@ -682,7 +692,7 @@ async def open_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Quick list of open position tokens (real DB)."""
     try:
         from b20_mainnet_sniper import get_open_positions
-        opens = await asyncio.to_thread(get_open_positions, _current_w3)
+        opens = await asyncio.to_thread(get_open_positions, _get_w3())
         if not opens:
             await update.message.reply_text("No open positions.")
             return
@@ -754,7 +764,7 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def activation_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """B20 activation status (real on-chain)."""
-    use_w3 = _current_w3
+    use_w3 = _get_w3()
     if not use_w3:
         await update.message.reply_text("No w3.")
         return
@@ -783,7 +793,7 @@ async def perftoken_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /perftoken <token>")
         return
     token = args[0]
-    use_w3 = _current_w3
+    use_w3 = _get_w3()
     try:
         from b20_mainnet_sniper import get_open_positions, get_token_price_in_eth
         def _get_perf():
@@ -811,7 +821,7 @@ async def refresh_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Force refresh positions data (re-query balances)."""
     try:
         from b20_mainnet_sniper import get_open_positions
-        opens = await asyncio.to_thread(get_open_positions, _current_w3)
+        opens = await asyncio.to_thread(get_open_positions, _get_w3())
         await update.message.reply_text(f"Refreshed. {len(opens)} positions loaded.")
     except Exception as e:
         await update.message.reply_text(f"Refresh error: {e}")
@@ -823,7 +833,7 @@ async def liq_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /liq <token>")
         return
     token = args[0]
-    use_w3 = _current_w3
+    use_w3 = _get_w3()
     if not use_w3:
         await update.message.reply_text("No w3 context.")
         return
@@ -848,7 +858,7 @@ async def simulate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /simulate <token> <eth>")
         return
     token, amt = args[0], float(args[1])
-    use_w3 = _current_w3
+    use_w3 = _get_w3()
     if not use_w3:
         await update.message.reply_text("No w3.")
         return
@@ -924,7 +934,7 @@ async def lastbuy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def summary_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Quick summary of bot state."""
-    use_w3 = _current_w3
+    use_w3 = _get_w3()
     try:
         from b20_mainnet_sniper import get_total_spent, get_estimated_portfolio_value, get_open_positions, get_win_rate, get_bot_address
         def _compute_sum():
@@ -955,7 +965,7 @@ async def profit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /profit <token>   (e.g. /profit 0x2a41...)")
         return
     token = args[0]
-    use_w3 = _current_w3
+    use_w3 = _get_w3()
     if not use_w3:
         await update.message.reply_text("No w3 context.")
         return
@@ -1030,7 +1040,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "cmd_status" or data == "status":
         # REAL status output - offload blocking web3
         status_msg = "📊 Bot Status: LIVE mode active.\nMonitoring pools + B20Factory.\nTG interactive + buttons ready.\n"
-        use_w3 = _current_w3
+        use_w3 = _get_w3()
         try:
             from b20_mainnet_sniper import get_bot_address, get_num_open_positions, get_win_rate
             addr = get_bot_address()
@@ -1073,7 +1083,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("🛑 Kill switch activated.")
 
     elif data == "cmd_pnl":
-        use_w3 = _current_w3
+        use_w3 = _get_w3()
         try:
             cached = _get_cached('pnl')
             if cached:
@@ -1106,7 +1116,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text(f"PnL error: {e}")
 
     elif data == "cmd_value":
-        use_w3 = _current_w3
+        use_w3 = _get_w3()
         try:
             cached = _get_cached('portfolio_value')
             if cached is not None:
@@ -1131,7 +1141,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text(f"Spent error: {e}")
 
     elif data == "cmd_summary":
-        use_w3 = _current_w3
+        use_w3 = _get_w3()
         try:
             cached_val = _get_cached('portfolio_value')
             cached_spent = _get_cached('spent')
@@ -1183,7 +1193,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             from b20_mainnet_sniper import get_open_positions
             def _compute_positions():
-                opens = get_open_positions(_current_w3)
+                opens = get_open_positions(_get_w3())
                 if not opens:
                     return "📊 No open positions."
                 msg = "📊 OPEN POSITIONS (REAL on-chain + DB):\n\n"
@@ -1211,7 +1221,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text(f"Positions error: {e}")
 
     elif data == "cmd_gas":
-        use_w3 = _current_w3
+        use_w3 = _get_w3()
         if use_w3:
             try:
                 from b20_mainnet_sniper import get_gas_info
@@ -1226,7 +1236,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text("No w3 context.")
 
     elif data == "cmd_activation":
-        use_w3 = _current_w3
+        use_w3 = _get_w3()
         if use_w3:
             try:
                 from b20_mainnet_sniper import get_activation_status
@@ -1282,7 +1292,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             from b20_mainnet_sniper import get_open_positions
             def _get_opens():
-                return get_open_positions(_current_w3)
+                return get_open_positions(_get_w3())
             loop = asyncio.get_running_loop()
             opens = await loop.run_in_executor(None, _get_opens)
             await query.message.reply_text(f"🔄 Refreshed. {len(opens)} positions (real on-chain balances).")
@@ -1293,7 +1303,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             from b20_mainnet_sniper import get_open_positions
             def _get_opens():
-                return get_open_positions(_current_w3, include_price=False)
+                return get_open_positions(_get_w3(), include_price=False)
             loop = asyncio.get_running_loop()
             opens = await loop.run_in_executor(None, _get_opens)
             if not opens:
@@ -1325,13 +1335,13 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             from b20_mainnet_sniper import get_open_positions, find_best_pool, check_pool_liquidity, get_token_price_in_eth
             def _get_liq():
-                opens = get_open_positions(_current_w3)
+                opens = get_open_positions(_get_w3())
                 if opens:
                     tok = opens[0]['token']
-                    pool, fee = find_best_pool(_current_w3, tok)
+                    pool, fee = find_best_pool(_get_w3(), tok)
                     if pool:
-                        liq = check_pool_liquidity(_current_w3, pool)
-                        price = get_token_price_in_eth(_current_w3, tok)
+                        liq = check_pool_liquidity(_get_w3(), pool)
+                        price = get_token_price_in_eth(_get_w3(), tok)
                         return f"💧 REAL Liq for {tok[:10]}... : {liq/1e18:.4f} ETH (fee {fee})\nPrice ~{price:.10f} ETH"
                     else:
                         return f"No pool for {tok[:10]}. Use /liq <token>"
@@ -1347,14 +1357,14 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             from b20_mainnet_sniper import get_open_positions, get_accurate_min_out, find_best_pool
             def _get_sim():
-                opens = get_open_positions(_current_w3)
+                opens = get_open_positions(_get_w3())
                 if opens:
                     tok = opens[0]['token']
-                    pool, fee = find_best_pool(_current_w3, tok)
+                    pool, fee = find_best_pool(_get_w3(), tok)
                     if not fee: fee=3000
                     amt = 0.003
-                    amount_in = _current_w3.to_wei(amt, 'ether')
-                    min_out = get_accurate_min_out(_current_w3, tok, fee, amount_in, 2000)
+                    amount_in = _get_w3().to_wei(amt, 'ether')
+                    min_out = get_accurate_min_out(_get_w3(), tok, fee, amount_in, 2000)
                     return f"🧪 REAL Simulate 0.003 ETH on {tok[:10]}... -> ~{min_out / 1e18:.4f} tokens (min out)"
                 else:
                     return "Use /simulate <token> <eth> for real Quoter output"
@@ -1368,10 +1378,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             from b20_mainnet_sniper import get_open_positions, run_token_safety
             def _get_safety():
-                opens = get_open_positions(_current_w3)
+                opens = get_open_positions(_get_w3())
                 if opens:
                     tok = opens[0]['token']
-                    res = run_token_safety(_current_w3, tok)
+                    res = run_token_safety(_get_w3(), tok)
                     return f"🛡️ REAL Safety for {tok[:10]}... : {res}"
                 else:
                     return "Use /safety <token> for real on-chain checks (liq, honeypot sim, etc)"
@@ -1385,10 +1395,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             from b20_mainnet_sniper import get_open_positions, get_token_price_in_eth
             def _get_perf():
-                opens = get_open_positions(_current_w3)
+                opens = get_open_positions(_get_w3())
                 if opens:
                     p = opens[0]
-                    price = get_token_price_in_eth(_current_w3, p['token']) if _current_w3 else 0
+                    price = get_token_price_in_eth(_get_w3(), p['token']) if _get_w3() else 0
                     val = p['held'] * price
                     pnl = val - p['eth_spent']
                     return f"📊 REAL Perftoken {p['token'][:10]}...\nHeld: {p['held']:.4f} Spent: {p['eth_spent']:.4f}\nPrice: {price:.10f}\nValue: {val:.6f} PnL: {pnl:.6f}"
@@ -1442,7 +1452,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             _, tkn, amt_str = parts
             amt = float(amt_str)
-            use_w3 = _current_w3
+            use_w3 = _get_w3()
             if use_w3 and _buy_callback and _cfg:
                 await query.edit_message_text(
                     f"🛒 Buying {amt} ETH of <code>{tkn}</code>...\n"
@@ -1465,7 +1475,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             _, tkn, pct_str = data.split("_", 2)
             pct = float(pct_str)
-            use_w3 = _current_w3
+            use_w3 = _get_w3()
             if use_w3 and _sell_callback and _cfg:
                 await query.edit_message_text(f"Executing sell {pct}% of {tkn} (real balance)...")
                 def _do_sell():
