@@ -1114,10 +1114,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 # calculate realized losses from 0-received
                 opens = get_open_positions(use_w3)
                 realized_loss = sum(p.get('eth_spent', 0) for p in opens if p.get('acquired', 0) == 0 and p.get('eth_spent', 0) > 0)
-                pnl = value - spent + realized_loss  # since realized is loss, but spent already includes, adjust? Wait, spent is total, value is current, realized loss is part of it
-                # better: total spent on open + realized = total out, current value - (total spent - realized? ) wait, simplify
-                effective_pnl = value - (spent - realized_loss)  # value from good positions - spent on good
-                # but to keep simple, show total spent, value, realized loss, effective
+                pnl = value - spent + realized_loss
+                effective_pnl = value - (spent - realized_loss)
+                wr = get_win_rate()
                 msg = (f"📈 PNL SUMMARY (REAL mainnet)\n"
                        f"Total ETH spent: {spent:.6f}\n"
                        f"Est. value (held positions): {value:.6f}\n"
