@@ -130,20 +130,12 @@ RPC_DEFAULT = "https://mainnet.base.org"
 # Add your own paid ones in .env for best performance.
 DEFAULT_BASE_RPCS = [
     "https://mainnet.base.org",
-    "https://base-mainnet.public.blastapi.io",
     "https://base.meowrpc.com",
-    "https://base-pokt.nodies.app",
-    "https://rpc.ankr.com/base",
-    "https://base.drpc.org",
-    "https://1rpc.io/base",
-    "https://base.blockpi.network/v1/rpc/public",
-    "https://base.api.onfinality.io/public",
-    "https://gateway.tenderly.co/public/base",
-    "https://base.llamarpc.com",
-    "https://base.rpc.subquery.network/public",
     "https://base-rpc.publicnode.com",
-    "https://base-mainnet-rpc.allthatnode.com",
     "https://base.publicnode.com",
+    "https://base-mainnet.public.blastapi.io",
+    "https://1rpc.io/base",
+    "https://gateway.tenderly.co/public/base",
 ]
 
 ACTIVATION_REGISTRY = to_checksum_address("0x8453000000000000000000000000000000000001")
@@ -426,66 +418,69 @@ async def monitor_positions_loop(w3: Web3, cfg: dict):
                 loop_w3 = w3  # fallback to original
             for token, pos in list(ACTIVE_POSITIONS.items()):
                 try:
-                    current_price = get_token_price_in_eth(loop_w3, token)
-                except Exception:
-                    current_price = 0
-
-                entry_price = pos['buy_price_eth']
-                token_amount = pos['token_amount']
-                buy_time = pos['timestamp']
-                highest_price = pos.get('highest_price_eth', entry_price)
-
-                if current_price > 0:
-                    if current_price > highest_price:
-                        pos['highest_price_eth'] = current_price
-                        highest_price = current_price
-
-                pnl_pct = ((current_price - entry_price) / entry_price) * 100 if (entry_price > 0 and current_price > 0) else 0
-                tsl_pct = ((highest_price - current_price) / highest_price) * 100 if (highest_price > 0 and current_price > 0) else 0
-                age_minutes = (time.time() - buy_time) / 60
-
-                tp_pct = cfg.get("TAKE_PROFIT_PCT", 100.0)
-                sl_pct = cfg.get("STOP_LOSS_PCT", 20.0)
-                tsl_limit_pct = cfg.get("TRAILING_STOP_LOSS_PCT", 15.0)
-                max_hold_minutes = cfg.get("MAX_HOLD_MINUTES", 15.0)
-
-                trigger_sell = False
-                reason = ""
-
-                if current_price > 0:
-                    if pnl_pct >= tp_pct:
+                    try:
+                        current_price = get_token_price_in_eth(loop_w3, token)
+                    except Exception:
+                        current_price = 0
+    
+                    entry_price = pos['buy_price_eth']
+                    token_amount = pos['token_amount']
+                    buy_time = pos['timestamp']
+                    highest_price = pos.get('highest_price_eth', entry_price)
+    
+                    if current_price > 0:
+                        if current_price > highest_price:
+                            pos['highest_price_eth'] = current_price
+                            highest_price = current_price
+    
+                    pnl_pct = ((current_price - entry_price) / entry_price) * 100 if (entry_price > 0 and current_price > 0) else 0
+                    tsl_pct = ((highest_price - current_price) / highest_price) * 100 if (highest_price > 0 and current_price > 0) else 0
+                    age_minutes = (time.time() - buy_time) / 60
+    
+                    tp_pct = cfg.get("TAKE_PROFIT_PCT", 100.0)
+                    sl_pct = cfg.get("STOP_LOSS_PCT", 20.0)
+                    tsl_limit_pct = cfg.get("TRAILING_STOP_LOSS_PCT", 15.0)
+                    max_hold_minutes = cfg.get("MAX_HOLD_MINUTES", 15.0)
+    
+                    trigger_sell = False
+                    reason = ""
+    
+                    if current_price > 0:
+                        if pnl_pct >= tp_pct:
+                            trigger_sell = True
+                            reason = f"Take Profit (+{pnl_pct:.1f}%)"
+                        elif pnl_pct <= -sl_pct:
+                            trigger_sell = True
+                            reason = f"Stop Loss ({pnl_pct:.1f}%)"
+                        elif tsl_pct >= tsl_limit_pct and pnl_pct > 0:
+                            trigger_sell = True
+                            reason = f"Trailing Stop Loss (-{tsl_pct:.1f}% from ATH, PnL +{pnl_pct:.1f}%)"
+    
+                    if not trigger_sell and age_minutes >= max_hold_minutes:
                         trigger_sell = True
-                        reason = f"Take Profit (+{pnl_pct:.1f}%)"
-                    elif pnl_pct <= -sl_pct:
-                        trigger_sell = True
-                        reason = f"Stop Loss ({pnl_pct:.1f}%)"
-                    elif tsl_pct >= tsl_limit_pct and pnl_pct > 0:
-                        trigger_sell = True
-                        reason = f"Trailing Stop Loss (-{tsl_pct:.1f}% from ATH, PnL +{pnl_pct:.1f}%)"
-
-                if not trigger_sell and age_minutes >= max_hold_minutes:
-                    trigger_sell = True
-                    reason = f"Time Limit Reached ({age_minutes:.1f} minutes hold)"
-
-                if trigger_sell:
-                    print(f"[MONITOR] Exiting position for {token}. Reason: {reason}")
-                    tg_send(f"🚨 <b>Automated Exit Triggered</b> for {token}\nReason: {reason}\nAmount: {token_amount:.6f}")
-                    pool, actual_fee = find_best_pool(loop_w3, token)
-                    fee = actual_fee or 3000
-                    decimals = get_token_decimals(loop_w3, token)
-                    amount_wei = int(token_amount * (10 ** decimals))
-                    tx_hash = attempt_sell(loop_w3, token, fee, amount_wei, cfg)
-                    if tx_hash:
-                        ACTIVE_POSITIONS.pop(token, None)
-                        FAILED_EXIT_ATTEMPTS.pop(token, None)
-                    else:
-                        print(f"[MONITOR] Failed to sell position for {token}")
-                        FAILED_EXIT_ATTEMPTS[token] = FAILED_EXIT_ATTEMPTS.get(token, 0) + 1
-                        if FAILED_EXIT_ATTEMPTS[token] >= 3:
-                            print(f"[MONITOR] Too many failed exit attempts for {token}. Marking position as dead/rugged.")
-                            tg_send(f"⚠️ <b>Rugged / Liquidity Drained</b>: Too many failed exit attempts for {token}. Removing from active monitoring.")
+                        reason = f"Time Limit Reached ({age_minutes:.1f} minutes hold)"
+    
+                    if trigger_sell:
+                        print(f"[MONITOR] Exiting position for {token}. Reason: {reason}")
+                        tg_send(f"🚨 <b>Automated Exit Triggered</b> for {token}\nReason: {reason}\nAmount: {token_amount:.6f}")
+                        pool, actual_fee = find_best_pool(loop_w3, token)
+                        fee = actual_fee or 3000
+                        decimals = get_token_decimals(loop_w3, token)
+                        amount_wei = int(token_amount * (10 ** decimals))
+                        tx_hash = attempt_sell(loop_w3, token, fee, amount_wei, cfg)
+                        if tx_hash:
                             ACTIVE_POSITIONS.pop(token, None)
                             FAILED_EXIT_ATTEMPTS.pop(token, None)
+                        else:
+                            print(f"[MONITOR] Failed to sell position for {token}")
+                            FAILED_EXIT_ATTEMPTS[token] = FAILED_EXIT_ATTEMPTS.get(token, 0) + 1
+                            if FAILED_EXIT_ATTEMPTS[token] >= 3:
+                                print(f"[MONITOR] Too many failed exit attempts for {token}. Marking position as dead/rugged.")
+                                tg_send(f"⚠️ <b>Rugged / Liquidity Drained</b>: Too many failed exit attempts for {token}. Removing from active monitoring.")
+                                ACTIVE_POSITIONS.pop(token, None)
+                                FAILED_EXIT_ATTEMPTS.pop(token, None)
+                except Exception as token_err:
+                    print(f"[MONITOR] Error checking token {token}: {token_err}")
 
             await asyncio.sleep(15)  # 15s between checks — less RPC pressure
         except Exception as e:
