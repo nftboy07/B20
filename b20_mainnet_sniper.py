@@ -412,6 +412,8 @@ def load_active_positions_from_db() -> Dict[str, Dict]:
         print(f"[DB] load active positions error: {e}")
     return positions
 
+FAILED_EXIT_ATTEMPTS = {}
+
 async def monitor_positions_loop(w3: Web3, cfg: dict):
     print("[MONITOR] Starting active position monitoring loop...")
     rpc_list = cfg.get("BACKUP_RPCS", DEFAULT_BASE_RPCS)
@@ -475,8 +477,15 @@ async def monitor_positions_loop(w3: Web3, cfg: dict):
                     tx_hash = attempt_sell(loop_w3, token, fee, amount_wei, cfg)
                     if tx_hash:
                         ACTIVE_POSITIONS.pop(token, None)
+                        FAILED_EXIT_ATTEMPTS.pop(token, None)
                     else:
                         print(f"[MONITOR] Failed to sell position for {token}")
+                        FAILED_EXIT_ATTEMPTS[token] = FAILED_EXIT_ATTEMPTS.get(token, 0) + 1
+                        if FAILED_EXIT_ATTEMPTS[token] >= 3:
+                            print(f"[MONITOR] Too many failed exit attempts for {token}. Marking position as dead/rugged.")
+                            tg_send(f"⚠️ <b>Rugged / Liquidity Drained</b>: Too many failed exit attempts for {token}. Removing from active monitoring.")
+                            ACTIVE_POSITIONS.pop(token, None)
+                            FAILED_EXIT_ATTEMPTS.pop(token, None)
 
             await asyncio.sleep(15)  # 15s between checks — less RPC pressure
         except Exception as e:
@@ -2004,10 +2013,14 @@ def attempt_sell(w3: Web3, token: str, fee: int, amount_token: int, cfg: dict, m
         "amountOutMinimum": min_out,
         "sqrtPriceLimitX96": 0,
     }
-    tx = router.functions.exactInputSingle(params).build_transaction({
-        "from": sender,
-        "chainId": CHAIN_ID,
-    })
+    try:
+        tx = router.functions.exactInputSingle(params).build_transaction({
+            "from": sender,
+            "chainId": CHAIN_ID,
+        })
+    except Exception as bte:
+        print(f"Failed to build sell transaction: {bte}")
+        return None
     priority_fee = w3.to_wei(2, "gwei")
     base_fee = w3.eth.get_block("latest").get("baseFeePerGas", 0) or w3.eth.gas_price
     max_fee = int(base_fee * (1 + 50 / 100)) + priority_fee
