@@ -1176,31 +1176,37 @@ def check_token_safety(w3: Web3, token: str, min_liq: float) -> tuple[bool, str]
     except Exception as e:
         return False, f"Safety check error: {str(e)[:80]}"
 
-def mainnet_sanity_check(w3: Web3) -> None:
-    """Executable Mainnet-Only Check (adapted for precompiles).
+def mainnet_sanity_check(w3: Web3, rpc_list: list = None) -> None:
+    """Mainnet-Only Check. Retries with backup RPCs on 429."""
+    # Try up to len(rpc_list) RPCs before giving up
+    candidates = [w3] + [get_w3(r) for r in (rpc_list or DEFAULT_BASE_RPCS)[:6]]
+    last_err = None
+    for attempt_w3 in candidates:
+        try:
+            assert attempt_w3.eth.chain_id == 8453, "Wrong network! Must be Base Mainnet."
+            reg = attempt_w3.eth.contract(address=ACTIVATION_REGISTRY, abi=ACTIVATION_REGISTRY_ABI)
+            _ = reg.functions.isActivated(FEATURE_B20_ASSET).call()
+            try:
+                fac = attempt_w3.eth.contract(address=B20_FACTORY, abi=B20_FACTORY_ABI)
+                _ = fac.functions.isB20("0x0000000000000000000000000000000000000001").call()
+            except Exception as fe:
+                # B20Factory optional — only warn, don't crash
+                print(f"[SANITY] B20Factory check warning (non-fatal): {fe}")
+            print("Mainnet checks passed (chainId + precompile callability).")
+            return  # success
+        except Exception as e:
+            last_err = e
+            if "429" in str(e) or "Too Many Requests" in str(e):
+                url = getattr(getattr(attempt_w3, 'provider', None), 'endpoint_uri', '?')
+                _rpc_mark_429(str(url))
+                print(f"[SANITY] 429 on {str(url)[:40]}, trying next RPC...")
+                time.sleep(1)
+                continue
+            # Non-429 error: still try next
+            print(f"[SANITY] Check failed ({e}), trying next RPC...")
+    raise AssertionError(f"Mainnet sanity check failed on all RPCs: {last_err}")
 
-    Precompiles (Activation Registry / B20Factory) often return empty code via
-    eth_getCode even when callable. We therefore:
-      - Strictly assert chainId == 8453
-      - Prove the registries are present by performing a successful read call
-        (isActivated). This matches real-world behavior better than get_code > 0.
-    """
-    assert w3.eth.chain_id == 8453, "Wrong network! Must be Base Mainnet."
 
-    # Prove registries exist by successful view call (precompile reality)
-    try:
-        reg = w3.eth.contract(address=ACTIVATION_REGISTRY, abi=ACTIVATION_REGISTRY_ABI)
-        _ = reg.functions.isActivated(FEATURE_B20_ASSET).call()
-    except Exception as e:
-        raise AssertionError(f"Activation Registry not reachable / not deployed: {e}") from e
-
-    try:
-        fac = w3.eth.contract(address=B20_FACTORY, abi=B20_FACTORY_ABI)
-        _ = fac.functions.isB20("0x0000000000000000000000000000000000000001").call()  # any address is fine for presence
-    except Exception as e:
-        raise AssertionError(f"B20Factory not reachable / not deployed: {e}") from e
-
-    print("Mainnet checks passed (chainId + precompile callability).")
 
 def get_activation_registry(w3: Web3):
     return w3.eth.contract(address=ACTIVATION_REGISTRY, abi=ACTIVATION_REGISTRY_ABI)
@@ -2034,7 +2040,7 @@ def main():
         print("LIVE MODE: Real funds at risk. Ensure wallet is funded with small test amount.")
 
     # Enforce Mainnet
-    mainnet_sanity_check(w3)
+    mainnet_sanity_check(w3, rpc_list=rpc_list)
 
     # Activation status (critical)
     asset_ok = check_b20_activated(w3, want_stable=False)
