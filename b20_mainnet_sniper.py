@@ -409,34 +409,44 @@ def load_active_positions_from_db() -> Dict[str, Dict]:
 
 async def monitor_positions_loop(w3: Web3, cfg: dict):
     print("[MONITOR] Starting active position monitoring loop...")
+    rpc_list = cfg.get("BACKUP_RPCS", DEFAULT_BASE_RPCS)
     while True:
         try:
+            # rotate RPC each iteration to distribute load across endpoints
+            try:
+                loop_w3 = get_best_w3(rpc_list)
+            except Exception:
+                loop_w3 = w3  # fallback to original
+
             for token, pos in list(ACTIVE_POSITIONS.items()):
-                current_price = get_token_price_in_eth(w3, token)
+                try:
+                    current_price = get_token_price_in_eth(loop_w3, token)
+                except Exception:
+                    continue
                 if current_price <= 0:
                     continue
-                
+
                 entry_price = pos['buy_price_eth']
                 token_amount = pos['token_amount']
                 buy_time = pos['timestamp']
                 highest_price = pos.get('highest_price_eth', entry_price)
-                
+
                 if current_price > highest_price:
                     pos['highest_price_eth'] = current_price
                     highest_price = current_price
-                
+
                 pnl_pct = ((current_price - entry_price) / entry_price) * 100 if entry_price > 0 else 0
                 tsl_pct = ((highest_price - current_price) / highest_price) * 100 if highest_price > 0 else 0
                 age_minutes = (time.time() - buy_time) / 60
-                
+
                 tp_pct = cfg.get("TAKE_PROFIT_PCT", 100.0)
                 sl_pct = cfg.get("STOP_LOSS_PCT", 20.0)
                 tsl_limit_pct = cfg.get("TRAILING_STOP_LOSS_PCT", 15.0)
                 max_hold_minutes = cfg.get("MAX_HOLD_MINUTES", 15.0)
-                
+
                 trigger_sell = False
                 reason = ""
-                
+
                 if pnl_pct >= tp_pct:
                     trigger_sell = True
                     reason = f"Take Profit (+{pnl_pct:.1f}%)"
@@ -449,25 +459,25 @@ async def monitor_positions_loop(w3: Web3, cfg: dict):
                 elif age_minutes >= max_hold_minutes:
                     trigger_sell = True
                     reason = f"Time Limit Reached ({age_minutes:.1f} minutes hold)"
-                
+
                 if trigger_sell:
                     print(f"[MONITOR] Exiting position for {token}. Reason: {reason}")
                     tg_send(f"🚨 <b>Automated Exit Triggered</b> for {token}\nReason: {reason}\nAmount: {token_amount:.6f}")
-                    pool, actual_fee = find_best_pool(w3, token)
+                    pool, actual_fee = find_best_pool(loop_w3, token)
                     fee = actual_fee or 3000
-                    decimals = get_token_decimals(w3, token)
+                    decimals = get_token_decimals(loop_w3, token)
                     amount_wei = int(token_amount * (10 ** decimals))
-                    
-                    tx_hash = attempt_sell(w3, token, fee, amount_wei, cfg)
+                    tx_hash = attempt_sell(loop_w3, token, fee, amount_wei, cfg)
                     if tx_hash:
                         ACTIVE_POSITIONS.pop(token, None)
                     else:
                         print(f"[MONITOR] Failed to sell position for {token}")
-                        
-            await asyncio.sleep(10)
+
+            await asyncio.sleep(15)  # 15s between checks — less RPC pressure
         except Exception as e:
             print(f"[MONITOR] Position loop error: {e}")
-            await asyncio.sleep(10)
+            await asyncio.sleep(15)
+
 
 recent_buys = []
 
@@ -522,40 +532,103 @@ def get_safe_config(cfg: dict) -> dict:
         safe["BACKUP_RPCS"] = [mask_sensitive(r) for r in safe.get("BACKUP_RPCS", [])]
     return safe
 
+
+# =============================================================================
+# SMART RPC ROTATOR — round-robin with 429 cooldown
+# =============================================================================
+import threading as _threading
+import requests as _requests
+
+_rpc_lock = _threading.Lock()
+_rpc_cooldowns: dict = {}          # rpc_url -> time when cooldown expires
+_RPC_COOLDOWN_SECS = 30            # skip a 429'd RPC for this long
+
+def _rpc_is_available(url: str) -> bool:
+    """Return True if this RPC is not in cooldown."""
+    exp = _rpc_cooldowns.get(url, 0)
+    return time.time() > exp
+
+def _rpc_mark_429(url: str):
+    """Put an RPC into cooldown for _RPC_COOLDOWN_SECS."""
+    with _rpc_lock:
+        _rpc_cooldowns[url] = time.time() + _RPC_COOLDOWN_SECS
+        print(f"[RPC] 429 on {url[:40]}... → cooldown {_RPC_COOLDOWN_SECS}s")
+
+_rpc_index = 0  # global round-robin cursor
+
 def get_w3(rpc_url: str) -> Web3:
+    """Build a Web3 instance for the given URL."""
     if rpc_url.startswith("wss://"):
         try:
             from web3.providers import LegacyWebSocketProvider
-            w3 = Web3(LegacyWebSocketProvider(rpc_url))
+            return Web3(LegacyWebSocketProvider(rpc_url))
         except ImportError:
             try:
-                w3 = Web3(Web3.WebsocketProvider(rpc_url))
+                return Web3(Web3.WebsocketProvider(rpc_url))
             except:
-                w3 = Web3(Web3.WebSocketProvider(rpc_url))
-    else:
-        w3 = Web3(Web3.HTTPProvider(rpc_url))
-    return w3
+                return Web3(Web3.WebSocketProvider(rpc_url))
+    # HTTP: wrap provider so 429s are caught and trigger rotation
+    class _RotatingHTTPProvider(Web3.HTTPProvider):
+        def make_request(self, method, params):
+            try:
+                resp = super().make_request(method, params)
+            except Exception as e:
+                if "429" in str(e) or "Too Many Requests" in str(e):
+                    _rpc_mark_429(rpc_url)
+                raise
+            # also check HTTP-level 429 embedded in response
+            if isinstance(resp, dict) and resp.get("error"):
+                err = str(resp["error"])
+                if "429" in err or "rate" in err.lower():
+                    _rpc_mark_429(rpc_url)
+            return resp
+    return Web3(_RotatingHTTPProvider(rpc_url))
+
+def get_best_w3(rpc_list: list = None) -> Web3:
+    """
+    Return a live Web3 using round-robin across available (non-429'd) RPCs.
+    Falls back to any RPC if all are in cooldown.
+    """
+    global _rpc_index
+    if not rpc_list:
+        rpc_list = DEFAULT_BASE_RPCS
+    available = [r for r in rpc_list if _rpc_is_available(r)]
+    if not available:
+        available = rpc_list  # all cooling down — use any
+    with _rpc_lock:
+        _rpc_index = (_rpc_index + 1) % len(available)
+        chosen = available[_rpc_index % len(available)]
+    return get_w3(chosen)
 
 def get_working_w3(rpc_list: list = None, max_attempts: int = 5) -> Web3:
-    """Try multiple RPCs until one works.
-    Tries in provided order (put paid/fast ones first in BACKUP_RPCS for lowest latency sniping/buttons).
-    No shuffle so user-provided RPCs are preferred.
+    """
+    Try multiple RPCs until one works (chain_id check).
+    Skips RPCs in 429 cooldown. Falls back to any RPC if all cooling down.
     """
     if not rpc_list:
         rpc_list = DEFAULT_BASE_RPCS
-    rpc_list = list(rpc_list)  # copy - order matters: paid first = faster buttons/auto-snipes
+    tried = set()
     for _ in range(max_attempts):
-        for rpc in rpc_list:
+        available = [r for r in rpc_list if _rpc_is_available(r) and r not in tried]
+        if not available:
+            available = [r for r in rpc_list if r not in tried]
+        if not available:
+            break
+        for rpc in available:
+            tried.add(rpc)
             try:
                 w3 = get_w3(rpc)
                 if w3.eth.chain_id == CHAIN_ID:
                     print(f"Using RPC: {rpc[:50]}...")
                     return w3
             except Exception as e:
+                if "429" in str(e) or "Too Many Requests" in str(e):
+                    _rpc_mark_429(rpc)
                 print(f"RPC {rpc[:30]}... failed: {str(e)[:60]}, trying next...")
-                continue
-        time.sleep(0.5)  # brief pause before full retry
-    raise Exception("No working RPC found after attempts. Check your internet or add more RPCs in .env")
+        time.sleep(0.3)
+    raise Exception("No working RPC found. Check your internet or add more RPCs in .env BACKUP_RPCS")
+
+
 
 # =============================================================================
 # TELEGRAM NOTIFICATIONS (optional)
