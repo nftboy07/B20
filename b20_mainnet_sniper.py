@@ -1954,6 +1954,37 @@ def attempt_sell(w3: Web3, token: str, fee: int, amount_token: int, cfg: dict, m
         return None
         
     sender = account.address
+    
+    # Auto-approve router to spend tokens (upgrade execution path)
+    try:
+        erc = w3.eth.contract(address=to_checksum_address(token), abi=ERC20_MIN_ABI)
+        allowance = erc.functions.allowance(sender, UNISWAP_V3_ROUTER).call()
+        if allowance < amount_token:
+            print(f"[APPROVE] Approving {token} for SwapRouter02...")
+            approve_tx = erc.functions.approve(
+                UNISWAP_V3_ROUTER,
+                115792089237316195423570985008687907853269984665640564039457584007913129639935  # uint256 max
+            ).build_transaction({
+                "from": sender,
+                "nonce": w3.eth.get_transaction_count(sender),
+                "chainId": CHAIN_ID,
+            })
+            approve_gas = estimate_gas_with_buffer(w3, approve_tx)
+            approve_tx["gas"] = approve_gas
+            priority_fee = w3.to_wei(2, "gwei")
+            base_fee = w3.eth.get_block("latest").get("baseFeePerGas", 0) or w3.eth.gas_price
+            approve_tx["maxFeePerGas"] = int(base_fee * 1.5) + priority_fee
+            approve_tx["maxPriorityFeePerGas"] = priority_fee
+            
+            signed_approve = account.sign_transaction(approve_tx)
+            approve_hash = send_raw_transaction_safe(w3, signed_approve.raw_transaction)
+            print(f"[APPROVE] Sent approval tx: {approve_hash.hex()}")
+            w3.eth.wait_for_transaction_receipt(approve_hash, timeout=60)
+            print("[APPROVE] Approval confirmed.")
+    except Exception as ae:
+        print(f"[APPROVE] Error in approval: {ae}")
+        return None
+
     pool = find_or_wait_pool(w3, token, WETH, fee) or find_or_wait_pool(w3, WETH, token, fee)
     if not pool:
         print("No pool for sell")
