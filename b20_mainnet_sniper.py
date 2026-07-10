@@ -1534,82 +1534,94 @@ def attempt_buy(w3: Web3, token: str, fee: int, amount_eth: float, cfg: dict,
             signed = account.sign_transaction(tx)
 
             try:
-                # record balance before for accurate net received (accounts for tax on transfer)
-                balance_before = 0
-                try:
-                    erc = w3.eth.contract(address=to_checksum_address(token), abi=ERC20_MIN_ABI)
-                    dec = get_token_decimals(w3, token)
-                    balance_before = erc.functions.balanceOf(sender).call()
-                except:
-                    pass
-
                 tx_hash = send_raw_transaction_safe(w3, signed.raw_transaction)
                 global recent_buys
                 recent_buys.append(time.time())
                 print("Buy tx sent:", tx_hash.hex())
-                tg_send(f"💰 Buy tx sent for <code>{token}</code>\nAmount: {amount_eth} ETH\nTx: <code>{tx_hash.hex()}</code>")
+                tg_send(f"💰 Buy tx sent for <code>{token}</code>\nAmount: {amount_eth} ETH\nTx: <a href='https://basescan.org/tx/{tx_hash.hex()}'>{tx_hash.hex()[:20]}...</a>")
                 receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=90)
+
                 if receipt.status == 1:
                     print("BUY SUCCESS:", tx_hash.hex())
-                    # Better: parse actual transferred amount from the tx logs (Transfer event to our wallet)
-                    # This captures what the swap/pool actually delivered, even if token has tax/burn
-                    received_tokens = 0.0
+
+                    # ── Step 1: get decimals (required for all calculations) ──────────
+                    dec = 18  # safe default
+                    sym = "?"
                     try:
-                        erc = w3.eth.contract(address=to_checksum_address(token), abi=ERC20_MIN_ABI)
                         dec = get_token_decimals(w3, token)
-                        balance_after = erc.functions.balanceOf(sender).call()
-                        received_tokens = max(0, (balance_after - balance_before) / (10 ** dec))
-                    except Exception as be:
-                        print(f"balance delta error: {be}")
-
-                    # Also parse Transfer and Swap logs for gross amount (before tax)
-                    try:
-                        transfer_topic = keccak(text="Transfer(address,address,uint256)").hex()
-                        swap_topic = keccak(text="Swap(address,address,int256,int256,uint160,uint128,int24)").hex()
-                        gross = 0.0
-                        for log in receipt.get("logs", []):
-                            addr = log.get("address", "").lower()
-                            topics = log.get("topics", [])
-                            if len(topics) >= 3:
-                                topic0 = topics[0].hex() if hasattr(topics[0], "hex") else str(topics[0])
-                                if addr == token.lower() and topic0.lower().endswith(transfer_topic.lower()):
-                                    to_padded = topics[2].hex() if hasattr(topics[2], "hex") else str(topics[2])
-                                    to_addr = "0x" + to_padded[-40:]
-                                    if to_addr.lower() == sender.lower():
-                                        data = log.get("data", b"")
-                                        if isinstance(data, str):
-                                            data = bytes.fromhex(data[2:] if data.startswith("0x") else data)
-                                        amount = int.from_bytes(data, "big")
-                                        gross = max(gross, amount / (10 ** dec))
-                                elif pool and addr == pool.lower() and topic0.lower().endswith(swap_topic.lower()):
-                                    # parse swap for output amount
-                                    data = log.get("data", b"")
-                                    if isinstance(data, str):
-                                        data = bytes.fromhex(data[2:] if data.startswith("0x") else data)
-                                    amount0 = int.from_bytes(data[0:32], "big", signed=True)
-                                    amount1 = int.from_bytes(data[32:64], "big", signed=True)
-                                    # take the positive amount for the output (the one the buyer receives)
-                                    out_amount = max(abs(amount0), abs(amount1))
-                                    gross = max(gross, out_amount / (10 ** dec))
-                        if gross > received_tokens:
-                            received_tokens = gross
-                    except Exception as be:
-                        print(f"log parse error: {be}")
-
-                    if received_tokens == 0:
-                        # final fallback
+                        sym_erc = w3.eth.contract(address=to_checksum_address(token), abi=ERC20_MIN_ABI)
                         try:
-                            erc = w3.eth.contract(address=to_checksum_address(token), abi=ERC20_MIN_ABI)
-                            dec = get_token_decimals(w3, token)
-                            bal = erc.functions.balanceOf(sender).call()
-                            received_tokens = bal / (10 ** dec) if bal else 0.0
+                            sym = sym_erc.functions.symbol().call()
                         except:
                             pass
+                    except Exception as de:
+                        print(f"[BUY] decimals error: {de}")
+
+                    # ── Step 2: Parse Transfer logs from receipt (most reliable) ─────
+                    received_tokens = 0.0
+                    TRANSFER_SIG = keccak(text="Transfer(address,address,uint256)").hex()  # 64 hex chars, no 0x
+                    try:
+                        logs = list(receipt.logs)  # AttributeDict → list
+                        print(f"[BUY] Scanning {len(logs)} logs for Transfer to sender")
+                        for log in logs:
+                            log_addr = log.get("address", "") if isinstance(log, dict) else getattr(log, "address", "")
+                            if log_addr.lower() != token.lower():
+                                continue
+                            raw_topics = log.get("topics", []) if isinstance(log, dict) else getattr(log, "topics", [])
+                            if not raw_topics:
+                                continue
+                            t0 = raw_topics[0]
+                            t0_hex = (t0.hex() if hasattr(t0, "hex") else str(t0)).lstrip("0x").lower()
+                            if t0_hex != TRANSFER_SIG.lower():
+                                continue
+                            if len(raw_topics) < 3:
+                                continue
+                            # topic[2] = to address (padded to 32 bytes)
+                            t2 = raw_topics[2]
+                            t2_hex = t2.hex() if hasattr(t2, "hex") else str(t2)
+                            to_addr = "0x" + t2_hex[-40:]
+                            # Accept transfer to any of our wallets
+                            global accounts_list
+                            our_addrs = [a.address.lower() for _, a in accounts_list] if accounts_list else [sender.lower()]
+                            if to_addr.lower() not in our_addrs:
+                                continue
+                            raw_data = log.get("data", b"") if isinstance(log, dict) else getattr(log, "data", b"")
+                            if isinstance(raw_data, str):
+                                raw_data = bytes.fromhex(raw_data[2:] if raw_data.startswith("0x") else raw_data)
+                            if len(raw_data) >= 32:
+                                amount_raw = int.from_bytes(raw_data[:32], "big")
+                                amount_human = amount_raw / (10 ** dec)
+                                print(f"[BUY] Transfer log → {amount_human:.6f} {sym} to {to_addr}")
+                                received_tokens = max(received_tokens, amount_human)
+                    except Exception as lpe:
+                        print(f"[BUY] log parse error: {lpe}")
+
+                    # ── Step 3: Fallback — live balanceOf across all wallets ──────────
+                    if received_tokens == 0.0:
+                        print("[BUY] Log parse gave 0, trying live balanceOf fallback...")
+                        try:
+                            erc = w3.eth.contract(address=to_checksum_address(token), abi=ERC20_MIN_ABI)
+                            total_bal = 0
+                            our_addrs = [a.address for _, a in accounts_list] if accounts_list else [sender]
+                            for addr in our_addrs:
+                                try:
+                                    total_bal += erc.functions.balanceOf(addr).call()
+                                except Exception as be2:
+                                    print(f"[BUY] balanceOf({addr}) error: {be2}")
+                            received_tokens = total_bal / (10 ** dec) if total_bal else 0.0
+                            print(f"[BUY] balanceOf fallback → {received_tokens:.6f} {sym}")
+                        except Exception as fe:
+                            print(f"[BUY] fallback balanceOf error: {fe}")
+
                     log_trade(token, "buy", amount_eth, tx_hash.hex(), "success", token_amount=received_tokens)
-                    tg_send(f"✅ <b>BUY SUCCESS</b> for {token}\nTx: <code>{tx_hash.hex()}</code>\nReceived ~{received_tokens:.6f} tokens (for {amount_eth} ETH)")
-                    export_trades_csv()  # analytics #87
-                    # Upgrade #63-64: basic TP ladder with sell buttons
-                    print(f"[TP LADDER] For {token}: consider sell 25% at 2x, 25% at 5x, 50% at 10x. Current entry {amount_eth} ETH. Received: {received_tokens}")
+                    tg_send(
+                        f"✅ <b>BUY SUCCESS</b>\n"
+                        f"Token: <code>{token}</code> ({sym})\n"
+                        f"ETH spent: {amount_eth}\n"
+                        f"Received: <b>{received_tokens:.6f} {sym}</b>\n"
+                        f"Tx: <a href='https://basescan.org/tx/{tx_hash.hex()}'>{tx_hash.hex()[:20]}...</a>"
+                    )
+                    export_trades_csv()
                     sell_buttons = {
                         "inline_keyboard": [
                             [{"text": "Sell 25%", "callback_data": f"sell_{token}_25"},
@@ -1617,16 +1629,17 @@ def attempt_buy(w3: Web3, token: str, fee: int, amount_eth: float, cfg: dict,
                             [{"text": "Sell 100%", "callback_data": f"sell_{token}_100"}],
                         ]
                     }
-                    tg_send(f"🎉 Bought {token}. TP options:", reply_markup=sell_buttons)
-                    # Simple hook: if not dry, could auto schedule but for safety manual via TG
+                    tg_send(f"🎉 Bought <b>{sym}</b>. Quick TP options:", reply_markup=sell_buttons)
                     return tx_hash.hex()
                 else:
                     print("Buy tx reverted.")
-                    tg_send(f"❌ Buy tx reverted for {token}")
+                    tg_send(f"❌ Buy tx <b>reverted</b> on-chain for <code>{token}</code>\nTx: <a href='https://basescan.org/tx/{tx_hash.hex()}'>{tx_hash.hex()[:20]}...</a>")
             except Exception as e:
                 print(f"Send error: {e}")
-                tg_send(f"❌ Buy error for {token}: {str(e)[:100]}")
+                tg_send(f"❌ Buy send error for <code>{token}</code>: {str(e)[:200]}")
                 traceback.print_exc()
+
+
 
             # Per spec: if failed, retry immediately with higher gas / lower slippage
             if attempt < max_retries:
