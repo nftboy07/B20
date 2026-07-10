@@ -424,26 +424,24 @@ async def monitor_positions_loop(w3: Web3, cfg: dict):
                 loop_w3 = get_best_w3(rpc_list)
             except Exception:
                 loop_w3 = w3  # fallback to original
-
             for token, pos in list(ACTIVE_POSITIONS.items()):
                 try:
                     current_price = get_token_price_in_eth(loop_w3, token)
                 except Exception:
-                    continue
-                if current_price <= 0:
-                    continue
+                    current_price = 0
 
                 entry_price = pos['buy_price_eth']
                 token_amount = pos['token_amount']
                 buy_time = pos['timestamp']
                 highest_price = pos.get('highest_price_eth', entry_price)
 
-                if current_price > highest_price:
-                    pos['highest_price_eth'] = current_price
-                    highest_price = current_price
+                if current_price > 0:
+                    if current_price > highest_price:
+                        pos['highest_price_eth'] = current_price
+                        highest_price = current_price
 
-                pnl_pct = ((current_price - entry_price) / entry_price) * 100 if entry_price > 0 else 0
-                tsl_pct = ((highest_price - current_price) / highest_price) * 100 if highest_price > 0 else 0
+                pnl_pct = ((current_price - entry_price) / entry_price) * 100 if (entry_price > 0 and current_price > 0) else 0
+                tsl_pct = ((highest_price - current_price) / highest_price) * 100 if (highest_price > 0 and current_price > 0) else 0
                 age_minutes = (time.time() - buy_time) / 60
 
                 tp_pct = cfg.get("TAKE_PROFIT_PCT", 100.0)
@@ -454,16 +452,18 @@ async def monitor_positions_loop(w3: Web3, cfg: dict):
                 trigger_sell = False
                 reason = ""
 
-                if pnl_pct >= tp_pct:
-                    trigger_sell = True
-                    reason = f"Take Profit (+{pnl_pct:.1f}%)"
-                elif pnl_pct <= -sl_pct:
-                    trigger_sell = True
-                    reason = f"Stop Loss ({pnl_pct:.1f}%)"
-                elif tsl_pct >= tsl_limit_pct and pnl_pct > 0:
-                    trigger_sell = True
-                    reason = f"Trailing Stop Loss (-{tsl_pct:.1f}% from ATH, PnL +{pnl_pct:.1f}%)"
-                elif age_minutes >= max_hold_minutes:
+                if current_price > 0:
+                    if pnl_pct >= tp_pct:
+                        trigger_sell = True
+                        reason = f"Take Profit (+{pnl_pct:.1f}%)"
+                    elif pnl_pct <= -sl_pct:
+                        trigger_sell = True
+                        reason = f"Stop Loss ({pnl_pct:.1f}%)"
+                    elif tsl_pct >= tsl_limit_pct and pnl_pct > 0:
+                        trigger_sell = True
+                        reason = f"Trailing Stop Loss (-{tsl_pct:.1f}% from ATH, PnL +{pnl_pct:.1f}%)"
+
+                if not trigger_sell and age_minutes >= max_hold_minutes:
                     trigger_sell = True
                     reason = f"Time Limit Reached ({age_minutes:.1f} minutes hold)"
 
