@@ -250,7 +250,10 @@ UNISWAP_V3_POOL_ABI = [
      "stateMutability": "view", "type": "function"}
 ]
 
-# Uniswap V3 Router ABI (struct style for exactInputSingle)
+# Uniswap V3 SwapRouter02 ABI — exactInputSingle
+# Selector: 0x04e45aaf
+# Struct: (tokenIn, tokenOut, fee, recipient, amountIn, amountOutMinimum, sqrtPriceLimitX96)
+# NO 'deadline' field (removed vs old SwapRouter). recipient stays at position 4.
 UNISWAP_V3_ROUTER_ABI = [
     {
         "inputs": [
@@ -260,12 +263,11 @@ UNISWAP_V3_ROUTER_ABI = [
                     {"internalType": "address", "name": "tokenOut", "type": "address"},
                     {"internalType": "uint24", "name": "fee", "type": "uint24"},
                     {"internalType": "address", "name": "recipient", "type": "address"},
-                    {"internalType": "uint256", "name": "deadline", "type": "uint256"},
                     {"internalType": "uint256", "name": "amountIn", "type": "uint256"},
                     {"internalType": "uint256", "name": "amountOutMinimum", "type": "uint256"},
                     {"internalType": "uint160", "name": "sqrtPriceLimitX96", "type": "uint160"}
                 ],
-                "internalType": "struct ISwapRouter.ExactInputSingleParams",
+                "internalType": "struct IV3SwapRouter.ExactInputSingleParams",
                 "name": "params",
                 "type": "tuple"
             }
@@ -1493,22 +1495,25 @@ def find_aerodrome_pool(w3: Web3, token_a: str, token_b: str) -> Optional[str]:
     return None
 
 def build_buy_tx(w3: Web3, token_out: str, fee: int, amount_in_wei: int, min_out: int, recipient: str) -> dict:
-    """Build exactInputSingle for buying token_out with ETH (WETH path)."""
+    """Build exactInputSingle for buying token_out with ETH via SwapRouter02.
+
+    SwapRouter02 ExactInputSingleParams (selector 0x04e45aaf, NO deadline):
+      tokenIn, tokenOut, fee, recipient, amountIn, amountOutMinimum, sqrtPriceLimitX96
+    Send msg.value = amountIn; SwapRouter02 wraps ETH -> WETH internally.
+    """
     router = get_router(w3)
-    deadline = int(time.time()) + 60 * 3  # 3 min
     params = {
         "tokenIn": WETH,
         "tokenOut": to_checksum_address(token_out),
         "fee": fee,
         "recipient": to_checksum_address(recipient),
-        "deadline": deadline,
         "amountIn": amount_in_wei,
         "amountOutMinimum": min_out,
         "sqrtPriceLimitX96": 0,
     }
     tx = router.functions.exactInputSingle(params).build_transaction({
         "from": recipient,
-        "value": amount_in_wei,   # sending ETH
+        "value": amount_in_wei,   # ETH forwarded; SwapRouter02 wraps to WETH internally
         "chainId": CHAIN_ID,
     })
     return tx
