@@ -839,6 +839,9 @@ def get_num_open_positions() -> int:
         return 0
 
 
+TOKEN_DECIMALS_CACHE = {}
+TOKEN_SYMBOL_CACHE = {}
+
 def get_open_positions(w3=None, include_price=True) -> list:
     """Risk #65: get currently open positions from DB.
     If w3 provided, includes current price, value, PnL, moon bag suggestion.
@@ -859,7 +862,11 @@ def get_open_positions(w3=None, include_price=True) -> list:
         """)
         rows = c.fetchall()
         conn.close()
+        
         positions = []
+        if not rows:
+            return positions
+            
         senders = []
         if w3:
             global accounts_list
@@ -870,7 +877,9 @@ def get_open_positions(w3=None, include_price=True) -> list:
                     senders = [w3.eth.account.from_key(os.getenv("PRIVATE_KEY")).address]
                 except:
                     pass
-        for token, eth_spent, tokens_acquired in rows:
+
+        def _process_row(row):
+            token, eth_spent, tokens_acquired = row
             held_human = 0.0
             price = 0.0
             value = 0.0
@@ -880,9 +889,28 @@ def get_open_positions(w3=None, include_price=True) -> list:
             entry_price = 0.0
             if acquired > 0:
                 entry_price = (eth_spent or 0) / acquired
+                
             suggestion = "Sell 70% now (recoup + profit), moon bag 30% for moon"
+            sym = ""
+            
             if w3 and senders:
                 try:
+                    # 1. Fetch decimals (cached or RPC)
+                    dec = get_token_decimals(w3, token)
+                    
+                    # 2. Fetch symbol (cached or RPC)
+                    t_lower = token.lower()
+                    if t_lower in TOKEN_SYMBOL_CACHE:
+                        sym = TOKEN_SYMBOL_CACHE[t_lower]
+                    else:
+                        try:
+                            erc_sym = w3.eth.contract(address=to_checksum_address(token), abi=ERC20_MIN_ABI)
+                            sym = erc_sym.functions.symbol().call()
+                            TOKEN_SYMBOL_CACHE[t_lower] = sym
+                        except:
+                            sym = "?"
+                            
+                    # 3. Fetch balances across all sender addresses
                     erc = w3.eth.contract(address=to_checksum_address(token), abi=ERC20_MIN_ABI)
                     held = 0
                     for s in senders:
@@ -890,42 +918,34 @@ def get_open_positions(w3=None, include_price=True) -> list:
                             held += erc.functions.balanceOf(s).call()
                         except:
                             pass
-                    dec = get_token_decimals(w3, token)
                     held_human = held / (10 ** dec) if held else 0.0
-                    if include_price:
-                        price = get_token_price_in_eth(w3, token)
-                        value = held_human * price
-                        pnl = value - (eth_spent or 0)
-                        pnl_pct = (pnl / (eth_spent or 1) * 100) if eth_spent else 0
+                    
+                    # 4. Fetch price ONLY if balance is > 0 and include_price is True
+                    if include_price and held_human > 0:
+                        try:
+                            price = get_token_price_in_eth(w3, token)
+                            value = held_human * price
+                            pnl = value - (eth_spent or 0)
+                            pnl_pct = (pnl / (eth_spent or 1) * 100) if eth_spent else 0
+                        except Exception as pe:
+                            print(f"[MONITOR] price fetch error for {token}: {pe}")
+                            suggestion = "Price not available yet (new token) - moon bag 30% recommended"
                     else:
                         price = 0.0
                         value = 0.0
                         pnl = 0.0
                         pnl_pct = 0.0
+                        if held_human == 0.0:
+                            suggestion = "Fully sold or 0 balance on-chain"
                 except Exception as e:
-                    # Price or balance may fail for very new tokens (Quoter reverts, thin liq)
-                    # Still show real on-chain held + spent from DB
-                    print(f"position price/balance error for {token}: {e}")
-                    try:
-                        erc2 = w3.eth.contract(address=to_checksum_address(token), abi=ERC20_MIN_ABI)
-                        held2 = erc2.functions.balanceOf(sender).call()
-                        dec2 = get_token_decimals(w3, token)
-                        held_human = held2 / (10 ** dec2) if held2 else 0.0
-                    except:
-                        pass
-                    suggestion = "Price not available yet (new token) - moon bag 30% recommended"
-            sym = ""
-            try:
-                if w3 and sender:
-                    erc_sym = w3.eth.contract(address=to_checksum_address(token), abi=ERC20_MIN_ABI)
-                    sym = erc_sym.functions.symbol().call()
-            except:
-                pass
+                    print(f"position balance error for {token}: {e}")
+                    
             note = ""
             if acquired == 0 and eth_spent > 0:
                 note = "0 tokens received from swap (tax/liq/redirect?)"
+                
             if acquired > 0 or held_human > 0:
-                positions.append({
+                return {
                     'token': token,
                     'symbol': sym,
                     'eth_spent': eth_spent or 0,
@@ -938,11 +958,22 @@ def get_open_positions(w3=None, include_price=True) -> list:
                     'pnl_pct': pnl_pct,
                     'suggestion': suggestion,
                     'note': note
-                })
+                }
+            return None
+
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(10, len(rows))) as executor:
+            results = executor.map(_process_row, rows)
+            
+        for res in results:
+            if res:
+                positions.append(res)
+                
         return positions
     except Exception as e:
         print(f"get_open_positions error: {e}")
         return []
+
 
 def check_holder_distribution(w3: Web3, token: str, max_top_holder_pct: float = 0.4) -> tuple[bool, str]:
     """Safety upgrade #24: basic holder concentration check (simplified on-chain)."""
@@ -1419,11 +1450,16 @@ def create_b20_live(w3: Web3, variant: int, salt: bytes, params: bytes, init_cal
 # UNISWAP V3 SNIPING LOGIC
 # =============================================================================
 def get_token_decimals(w3: Web3, token: str) -> int:
+    t_lower = token.lower()
+    if t_lower in TOKEN_DECIMALS_CACHE:
+        return TOKEN_DECIMALS_CACHE[t_lower]
     try:
         erc20 = w3.eth.contract(address=to_checksum_address(token), abi=[
             {"constant": True, "inputs": [], "name": "decimals", "outputs": [{"name": "", "type": "uint8"}], "type": "function"}
         ])
-        return erc20.functions.decimals().call()
+        dec = erc20.functions.decimals().call()
+        TOKEN_DECIMALS_CACHE[t_lower] = dec
+        return dec
     except Exception:
         return 18
 
