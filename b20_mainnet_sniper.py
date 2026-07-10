@@ -178,6 +178,7 @@ FEATURE_B20_STABLECOIN = keccak(text="base.b20_stablecoin")
 
 # Common fee tiers (do not filter; buy any)
 UNISWAP_FEE_TIERS = [500, 3000, 10000]
+POOL_DETECTION_TIMES = {}
 
 # Activation time (do not hardcode logic that bypasses the on-chain check)
 ACTIVATION_UTC = datetime(2026, 7, 8, 18, 0, 0, tzinfo=timezone.utc)
@@ -977,29 +978,156 @@ def get_open_positions(w3=None, include_price=True) -> list:
         return []
 
 
-def check_holder_distribution(w3: Web3, token: str, max_top_holder_pct: float = 0.4) -> tuple[bool, str]:
-    """Safety upgrade #24: basic holder concentration check (simplified on-chain)."""
+def find_token_deployer(w3: Web3, token: str) -> Optional[str]:
+    """Find the deployer of the token by looking at the first mint log or owner()."""
     try:
-        erc = w3.eth.contract(address=to_checksum_address(token), abi=ERC20_MIN_ABI)
+        token_addr = to_checksum_address(token)
+        transfer_sig = w3.keccak(text='Transfer(address,address,uint256)').hex()
+        zero_padded = '0x0000000000000000000000000000000000000000000000000000000000000000'
+        current = w3.eth.block_number
+        
+        # Scan last 5000 blocks for mint event (from 0x00...)
+        logs = w3.eth.get_logs({
+            'fromBlock': current - 5000,
+            'toBlock': 'latest',
+            'address': token_addr,
+            'topics': [transfer_sig, zero_padded]
+        })
+        if logs:
+            to_addr = '0x' + logs[0]['topics'][2].hex()[-40:]
+            return to_checksum_address(to_addr)
+            
+        # Fallback to owner() call if it exists
+        try:
+            erc = w3.eth.contract(address=token_addr, abi=ERC20_MIN_ABI)
+            owner = erc.functions.owner().call()
+            if owner and int(owner, 16) != 0:
+                return to_checksum_address(owner)
+        except:
+            pass
+            
+        return None
+    except Exception as e:
+        print(f"Error finding token deployer: {e}")
+        return None
+
+def check_holder_distribution(w3: Web3, token: str, max_top_holder_pct: float = 0.4) -> tuple[bool, str]:
+    """Safety upgrade #24: real holder distribution check by scanning recent Transfer logs."""
+    try:
+        token_addr = to_checksum_address(token)
+        erc = w3.eth.contract(address=token_addr, abi=ERC20_MIN_ABI)
         total_supply = erc.functions.totalSupply().call()
         if total_supply == 0:
             return False, "Zero supply"
-        # Lightweight: in production use events to find top holders. For now, check if supply >0
-        # and warn on high concentration possible. Full: parse Transfer logs for last 1000 blocks.
-        return True, "Holder distribution check passed (light)"
+            
+        current = w3.eth.block_number
+        transfer_sig = w3.keccak(text='Transfer(address,address,uint256)').hex()
+        
+        # Scan last 5000 blocks
+        logs = w3.eth.get_logs({
+            'fromBlock': current - 5000,
+            'toBlock': 'latest',
+            'address': token_addr,
+            'topics': [transfer_sig]
+        })
+        
+        balances = {}
+        for log in logs:
+            try:
+                from_addr = to_checksum_address("0x" + log['topics'][1].hex()[-40:])
+                to_addr = to_checksum_address("0x" + log['topics'][2].hex()[-40:])
+                value = int(log['data'].hex(), 16)
+                
+                if from_addr != "0x0000000000000000000000000000000000000000":
+                    balances[from_addr] = balances.get(from_addr, 0) - value
+                if to_addr != "0x0000000000000000000000000000000000000000":
+                    balances[to_addr] = balances.get(to_addr, 0) + value
+            except:
+                continue
+                
+        pool = find_or_wait_pool(w3, WETH, token, 3000) or find_or_wait_pool(w3, WETH, token, 10000)
+        pool_addr = to_checksum_address(pool) if pool else None
+        
+        # Filter zero address, pool, and contract itself
+        filtered_balances = {}
+        for addr, bal in balances.items():
+            if bal <= 0:
+                continue
+            if addr in ["0x0000000000000000000000000000000000000000", pool_addr, token_addr]:
+                continue
+            filtered_balances[addr] = bal
+            
+        if not filtered_balances:
+            return True, "No individual holders found"
+            
+        sorted_holders = sorted(filtered_balances.items(), key=lambda x: x[1], reverse=True)
+        top10_sum = sum(bal for addr, bal in sorted_holders[:10])
+        top10_pct = top10_sum / total_supply
+        
+        if top10_pct > max_top_holder_pct:
+            return False, f"High holder concentration: Top 10 holders own {top10_pct*100:.1f}% (> {max_top_holder_pct*100:.0f}%)"
+            
+        return True, f"Holder distribution check passed (Top 10 own {top10_pct*100:.1f}%)"
     except Exception as e:
         return True, f"Holder check skipped: {str(e)[:50]}"
 
-def check_lp_locked(w3: Web3, pool: str) -> tuple[bool, str]:
-    """Safety #23: check if LP looks locked/burned (V3 heuristic: liq present, no recent burn)."""
+def check_lp_locked(w3: Web3, pool: str, token: str, deployer: Optional[str]) -> tuple[bool, str]:
+    """Safety #23: check if LP is locked/burned by verifying if NFPM LP NFTs are owned by deployers."""
     try:
-        # For V3, positions are NFTs. Simple check: liq >0 and no obvious removal in recent blocks.
         liq = check_pool_liquidity(w3, pool)
-        if liq > 0:
-            return True, "LP liq present (assume locked or not removed)"
-        return False, "Low/no LP liquidity"
+        if liq == 0:
+            return False, "Zero pool liquidity"
+            
+        if not deployer:
+            return True, "LP check skipped (no deployer found)"
+            
+        nfpm_addr = to_checksum_address('0x03a520b32C04BF3bEEf7BEb72E919cf822Ed34f1')
+        NFPM_ABI = [
+            {'inputs': [{'name': 'owner', 'type': 'address'}], 'name': 'balanceOf', 'outputs': [{'type': 'uint256'}], 'stateMutability': 'view', 'type': 'function'},
+            {'inputs': [{'name': 'owner', 'type': 'address'}, {'name': 'index', 'type': 'uint256'}], 'name': 'tokenOfOwnerByIndex', 'outputs': [{'type': 'uint256'}], 'stateMutability': 'view', 'type': 'function'},
+            {'inputs': [{'name': 'tokenId', 'type': 'uint256'}], 'name': 'positions', 'outputs': [
+                {'type': 'uint96'}, {'type': 'address'}, {'type': 'address'}, {'type': 'address'},
+                {'type': 'uint24'}, {'type': 'int24'}, {'type': 'int24'}, {'type': 'uint128'},
+                {'type': 'uint256'}, {'type': 'uint256'}, {'type': 'uint256'}, {'type': 'uint256'}
+            ], 'stateMutability': 'view', 'type': 'function'}
+        ]
+        
+        nfpm = w3.eth.contract(address=nfpm_addr, abi=NFPM_ABI)
+        
+        deployer_has_lp = False
+        try:
+            bal = nfpm.functions.balanceOf(deployer).call()
+            for idx in range(bal):
+                tid = nfpm.functions.tokenOfOwnerByIndex(deployer, idx).call()
+                pos = nfpm.functions.positions(tid).call()
+                t0, t1 = pos[2], pos[3]
+                if t0.lower() == token.lower() or t1.lower() == token.lower():
+                    if pos[7] > 0:
+                        deployer_has_lp = True
+                        break
+        except Exception as e:
+            print(f"NFPM check error for deployer: {e}")
+            
+        if deployer_has_lp:
+            return False, "LP not locked: Deployer still owns the Uniswap V3 LP NFT"
+            
+        return True, "LP locked/burned: Deployer does not own the Uniswap V3 LP NFT"
     except Exception as e:
         return True, f"LP check skipped: {str(e)[:50]}"
+
+def check_dev_wallet_concentration(w3: Web3, token: str, deployer: Optional[str], total_supply: int, max_pct: float = 0.10) -> tuple[bool, str]:
+    """Safety upgrade #30: prevent buying if dev/creator holds >10% of total supply."""
+    if not deployer:
+        return True, "Dev concentration check skipped (no deployer found)"
+    try:
+        erc = w3.eth.contract(address=to_checksum_address(token), abi=ERC20_MIN_ABI)
+        bal = erc.functions.balanceOf(deployer).call()
+        pct = bal / total_supply
+        if pct > max_pct:
+            return False, f"Dev wallet holds {pct*100:.1f}% (> {max_pct*100:.0f}%) of total supply"
+        return True, f"Dev wallet holds safe balance: {pct*100:.1f}%"
+    except Exception as e:
+        return True, f"Dev concentration check skipped: {str(e)[:50]}"
 
 def simulate_transfer_tax(w3: Web3, token: str, amount: int) -> tuple[int, str]:
     """Safety #25: rough tax detection by transfer sim."""
@@ -1150,6 +1278,7 @@ def check_token_safety(w3: Web3, token: str, min_liq: float) -> tuple[bool, str]
 
         # === More safety upgrades ===
         safety_issues = []
+        deployer = find_token_deployer(w3, token)
 
         # Holder distribution (upgrade #24)
         safe, reason = check_holder_distribution(w3, token)
@@ -1157,43 +1286,24 @@ def check_token_safety(w3: Web3, token: str, min_liq: float) -> tuple[bool, str]
             safety_issues.append(reason)
 
         # LP locked (upgrade #23)
-        safe, reason = check_lp_locked(w3, pool)
+        safe, reason = check_lp_locked(w3, pool, token, deployer)
         if not safe:
             safety_issues.append(reason)
+
+        # Dev wallet (upgrade #30)
+        try:
+            erc = w3.eth.contract(address=to_checksum_address(token), abi=ERC20_MIN_ABI)
+            total_supply = erc.functions.totalSupply().call()
+            safe, reason = check_dev_wallet_concentration(w3, token, deployer, total_supply)
+            if not safe:
+                safety_issues.append(reason)
+        except Exception as e:
+            print(f"Error checking dev wallet: {e}")
 
         # Tax sim (upgrade #25)
         tax, _ = simulate_transfer_tax(w3, token, w3.to_wei(0.001, 'ether'))
         if tax > 100:  # >1%
             safety_issues.append(f"High tax {tax}")
-
-        # Dev wallet (upgrade #30)
-        try:
-            # Check if token creator holds significant % (simplified: if total supply and balance queries)
-            # For now, integrated in safety_score logic.
-            pass
-        except:
-            pass
-
-        # Rough tax simulation (upgrade #25) - buy small, check received vs expected
-        try:
-            # Already have roundtrip; add transfer sim
-            pass  # Quoter covers some
-        except:
-            pass
-
-        # LP lock/burn check (upgrade #23) - for V3 hard, check if liq provider is dead or locked
-        try:
-            # V3 positions are NFTs; simple heuristic: if pool has liq and no recent removal in logs
-            pass
-        except:
-            safety_issues.append("lp lock unknown")
-
-        # Dev wallet / initial allocation (upgrade #30)
-        try:
-            # Would parse creation tx for mint to creator
-            pass
-        except:
-            pass
 
         if safety_issues:
             return False, f"Safety issues: {', '.join(safety_issues)}"
@@ -1549,6 +1659,38 @@ def attempt_buy(w3: Web3, token: str, fee: int, amount_eth: float, cfg: dict,
     private_key, account = get_next_rotation_account(w3)
     sender = account.address
 
+    # Pool age cooldown (upgrade #39)
+    if not force:
+        min_age = cfg.get("POOL_MIN_AGE_SECONDS", 10)
+        detection_time = POOL_DETECTION_TIMES.get(token, time.time())
+        age = time.time() - detection_time
+        if age < min_age:
+            wait_time = min_age - age
+            print(f"[COOLDOWN] Pool is only {age:.1f}s old. Waiting {wait_time:.1f}s before buying...")
+            time.sleep(wait_time)
+
+    # Dynamic position sizing (upgrade #74)
+    if not force:
+        wr = get_win_rate()
+        total_trades = 0
+        try:
+            conn = sqlite3.connect(DB_FILE)
+            c = conn.cursor()
+            c.execute("SELECT COUNT(*) FROM trades WHERE action='buy'")
+            total_trades = c.fetchone()[0]
+            conn.close()
+        except Exception as dbe:
+            print(f"Error querying trade count: {dbe}")
+            
+        if total_trades >= 5:
+            old_amt = amount_eth
+            if wr >= 70.0:
+                amount_eth = min(amount_eth * 1.25, cfg.get("MAX_TRADE", 0.05))
+                print(f"[DYNAMIC SIZING] High win rate ({wr:.1f}%) detected. Scaled: {old_amt} -> {amount_eth} ETH")
+            elif wr < 40.0:
+                amount_eth = amount_eth * 0.5
+                print(f"[DYNAMIC SIZING] Low win rate ({wr:.1f}%) detected. Scaled: {old_amt} -> {amount_eth} ETH")
+
     if not check_rate_limit(cfg.get("MAX_BUYS_PER_MINUTE", 2)):
         msg = "⚠️ <b>Rate Limit</b>: Max buys/minute reached. Try again shortly."
         print("[RATE LIMIT] Exceeded max buys per minute.")
@@ -1628,7 +1770,9 @@ def attempt_buy(w3: Web3, token: str, fee: int, amount_eth: float, cfg: dict,
     for attempt in range(max_retries + 1):
         try:
             tx = build_buy_tx(w3, token, fee, amount_in, min_out, sender)
-            priority_fee = w3.to_wei(3 + attempt, "gwei")
+            # Randomize priority fee slightly (+0.1 to +0.5 Gwei) to prevent predictable gas signatures (upgrade #45)
+            rand_offset_gwei = random.uniform(0.1, 0.5)
+            priority_fee = w3.to_wei(3 + attempt + rand_offset_gwei, "gwei")
             base_fee = w3.eth.get_block("latest").get("baseFeePerGas", 0) or w3.eth.gas_price
             max_fee = int(base_fee * (1 + (50 + attempt * 50) / 100)) + priority_fee
             tx["maxFeePerGas"] = max_fee
@@ -1938,6 +2082,9 @@ def monitor_new_pools_and_snipe(w3: Web3, buy_amount_eth: float = 0.05, cfg: dic
 
                         if not new_token:
                             continue
+
+                        if new_token not in POOL_DETECTION_TIMES:
+                            POOL_DETECTION_TIMES[new_token] = time.time()
 
                         is_b20 = False
                         try:
