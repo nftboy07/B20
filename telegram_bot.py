@@ -54,7 +54,7 @@ def _get_chat_id() -> str:
 # These will be set by the main sniper before starting the bot
 _current_w3 = None
 _cfg = None
-_buy_callback: Optional[Callable] = None   # function(w3, token, fee, amount, cfg)
+_buy_callback: Optional[Callable] = None   # function(w3, token, fee, amount, cfg, force=False)
 _sell_callback: Optional[Callable] = None  # function(w3, token, fee, amount_token, cfg)
 
 
@@ -311,22 +311,26 @@ async def blacklist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"🖤 Blacklist request for {token} (add to main bot BLACKLIST set manually or extend wiring).")
 
 async def buy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Manual buy (upgrade #79)
+    # Manual buy — force=True skips pool/liq/MEV guards and reports every step to Telegram
     args = context.args or []
     if len(args) < 2:
         await update.message.reply_text("Usage: /buy <token> <eth_amount>")
         return
     token, amt = args[0], float(args[1])
-    await update.message.reply_text(f"🛒 Manual buy request: {amt} ETH for {token}. Triggering via bot context if available...")
+    msg = await update.message.reply_text(f"🛒 Buying {amt} ETH of <code>{token}</code>...\n<i>You will receive live updates in chat.</i>", parse_mode="HTML")
     if _buy_callback and _current_w3 and _cfg:
-        try:
-            def _manual_buy():
-                _buy_callback(_current_w3, token, 3000, amt, _cfg)
-            threading.Thread(target=_manual_buy, daemon=True).start()
-        except Exception as e:
-            await update.message.reply_text(f"Error triggering buy: {e}")
+        def _manual_buy():
+            try:
+                result = _buy_callback(_current_w3, token, 3000, amt, _cfg, force=True)
+                if not result:
+                    # tg_send already reported the reason; no extra message needed
+                    pass
+            except Exception as e:
+                from telegram_bot import tg_send as _tg
+                _tg(f"❌ Manual buy exception: <code>{str(e)[:200]}</code>")
+        threading.Thread(target=_manual_buy, daemon=True).start()
     else:
-        await update.message.reply_text("Buy context not fully wired yet. Use buttons or main bot.")
+        await update.message.reply_text("⚠️ Bot context not ready (no w3/cfg). Try again in a few seconds.")
 
 async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Real mainnet balance: /balance [<token>]  (no arg = ETH balance)
@@ -1432,25 +1436,29 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("B20 Bot Main Menu (LIVE - Real data):", reply_markup=get_main_menu_keyboard())
     elif data.startswith("buy_"):
         try:
-            _, tkn, amt_str = data.split("_", 2)
+            parts = data.split("_", 2)
+            if len(parts) < 3:
+                await query.edit_message_text("Buy button data invalid.")
+                return
+            _, tkn, amt_str = parts
             amt = float(amt_str)
-
             use_w3 = _current_w3
             if use_w3 and _buy_callback and _cfg:
-                # Send immediate ack via edit + fire the buy in background (like before)
-                await query.edit_message_text(f"Executing buy {amt} ETH on {tkn}...")
-
+                await query.edit_message_text(
+                    f"🛒 Buying {amt} ETH of <code>{tkn}</code>...\n"
+                    f"<i>Live updates will appear in chat.</i>",
+                    parse_mode="HTML"
+                )
                 def _do_buy():
                     try:
-                        # Let attempt_buy find best fee/pool (improved)
-                        _buy_callback(use_w3, tkn, 3000, amt, _cfg)
+                        # force=True: bypass pool/liq/MEV guards, reports all failures via tg_send
+                        _buy_callback(use_w3, tkn, 3000, amt, _cfg, force=True)
                     except Exception as be:
-                        # The main code already does tg_send on errors
                         print(f"[TG BUY] background error: {be}")
-
+                        tg_send(f"❌ Buy button error: <code>{str(be)[:200]}</code>")
                 threading.Thread(target=_do_buy, daemon=True).start()
             else:
-                await query.edit_message_text("Buy not available (no w3/cfg yet).")
+                await query.edit_message_text("⚠️ Buy not available (bot not fully started yet).")
         except Exception as e:
             await query.edit_message_text(f"Buy button error: {e}")
     elif data.startswith("sell_"):

@@ -1420,43 +1420,58 @@ def get_accurate_min_out(w3: Web3, token_out: str, fee: int, amount_in_wei: int,
         return int(amount_in_wei * (10000 - slippage_bps) / 10000)
 
 def attempt_buy(w3: Web3, token: str, fee: int, amount_eth: float, cfg: dict,
-                max_retries: int = 1) -> Optional[str]:
+                max_retries: int = 1, force: bool = False) -> Optional[str]:
     """
     Attempt to buy the new token with ETH.
-    - Checks liquidity first.
-    - Uses premium gas.
-    - Retries once with higher gas / lower slippage if first fails (per spec).
+    - force=True: manual TG buy — skips pool/liq/MEV guards, reports all errors via tg_send.
+    - force=False: automated snipe — full safety checks apply.
     """
     private_key, account = get_next_rotation_account(w3)
     sender = account.address
 
     if not check_rate_limit(cfg.get("MAX_BUYS_PER_MINUTE", 2)):
-        print("[RATE LIMIT] Exceeded max buys per minute. Throttling buy attempt.")
-        tg_send("⚠️ <b>Rate Limit Warning</b>: Snipe throttled to prevent spamming buys.")
+        msg = "⚠️ <b>Rate Limit</b>: Max buys/minute reached. Try again shortly."
+        print("[RATE LIMIT] Exceeded max buys per minute.")
+        tg_send(msg)
         return None
 
-    # Use best pool finder for reliability
+    # Pool discovery
     pool, actual_fee = find_best_pool(w3, token)
     if not pool:
-        print("No pool found for token yet.")
-        return None
-    if actual_fee is not None:
-        fee = actual_fee  # use the one that exists
-
-    # Wait a bit for liquidity if it's zero (common right after pool create)
-    for _ in range(5):  # up to ~5-10s wait
-        liq = check_pool_liquidity(w3, pool)
-        if liq > 0:
-            break
-        print("Pool liq still 0, waiting briefly...")
-        time.sleep(1)
+        if force:
+            # Manual buy: try all fee tiers directly
+            tg_send(f"⚠️ <b>No pool found automatically</b> for <code>{token}</code>. Trying fee=3000 anyway...")
+            fee = fee or 3000
+            pool = None  # will attempt tx without liq check
+        else:
+            msg = f"❌ No pool found for <code>{token}</code>. Buy aborted."
+            print(msg)
+            tg_send(msg)
+            return None
     else:
-        print("Pool has zero liquidity after wait. Skipping.")
-        return None
+        if actual_fee is not None:
+            fee = actual_fee
 
-    # MEV Sandwich / Front-run Protection Check
+    # Liquidity check
+    liq = 0
+    if pool:
+        for _ in range(5 if not force else 2):
+            liq = check_pool_liquidity(w3, pool)
+            if liq > 0:
+                break
+            print("Pool liq still 0, waiting briefly...")
+            time.sleep(1)
+        if liq == 0:
+            if force:
+                tg_send(f"⚠️ Pool liquidity is 0 for <code>{token}</code> — sending tx anyway (manual override).")
+            else:
+                tg_send(f"❌ Pool has zero liquidity for <code>{token}</code>. Buy aborted.")
+                print("Pool has zero liquidity after wait. Skipping.")
+                return None
+
+    # MEV Sandwich check (skip for manual force buys)
     global mempool_monitor_instance
-    if mempool_monitor_instance:
+    if mempool_monitor_instance and not force:
         base_fee = w3.eth.get_block("latest").get("baseFeePerGas", 0) or w3.eth.gas_price
         est_max_gas = int(base_fee * 1.5) + w3.to_wei(3, "gwei")
         is_sandwiched, count, details = mempool_monitor_instance.is_token_sandwiched(token, our_gas_price=est_max_gas)
@@ -1470,24 +1485,29 @@ def attempt_buy(w3: Web3, token: str, fee: int, amount_eth: float, cfg: dict,
                 tg_send(f"🚫 <b>Buy Skipped</b>: Token <code>{token}</code> has active sandwich/front-run activity in the mempool.")
                 return None
 
-    print(f"Pool {pool} liquidity: {liq}. Proceeding with buy attempt. (fee={fee})")
+    print(f"Pool {pool} liquidity: {liq}. Proceeding with buy attempt. (fee={fee}, force={force})")
 
     amount_in = w3.to_wei(amount_eth, "ether")
 
+
     # Proper slippage from cfg + accurate quote (Quoter upgrade)
     # Upgrade #42: dynamic slippage based on liq (deeper liq = tighter)
-    base_slip = cfg.get("SLIPPAGE_BPS", 2000)
-    liq_eth = liq / 1e18 if liq else 0
-    dyn_slip = max(500, min(base_slip, int(3000 - (liq_eth * 50))))  # tighter for deep pools
-    slippage_bps = dyn_slip
-    min_out = get_accurate_min_out(w3, token, fee, amount_in, slippage_bps)
-    print(f"Using Quoter + dynamic slippage {slippage_bps/100}% (liq~{liq_eth:.1f} ETH) → min_out={min_out}")
+    # For force buys with no pool / unknown liq, use wider slippage (5000bps) to avoid min_out revert
+    if force and liq == 0:
+        slippage_bps = 5000
+        min_out = get_accurate_min_out(w3, token, fee, amount_in, slippage_bps)
+        print(f"Force buy: widened slippage to {slippage_bps/100}% → min_out={min_out}")
+    else:
+        base_slip = cfg.get("SLIPPAGE_BPS", 2000)
+        liq_eth = liq / 1e18 if liq else 0
+        dyn_slip = max(500, min(base_slip, int(3000 - (liq_eth * 50))))
+        slippage_bps = dyn_slip
+        min_out = get_accurate_min_out(w3, token, fee, amount_in, slippage_bps)
+        print(f"Using Quoter + dynamic slippage {slippage_bps/100}% (liq~{liq_eth:.1f} ETH) → min_out={min_out}")
 
     for attempt in range(max_retries + 1):
         try:
             tx = build_buy_tx(w3, token, fee, amount_in, min_out, sender)
-            # Fix for "max priority fee per gas higher than max fee per gas"
-            # Compute properly: maxFee = base * multiplier + priority
             priority_fee = w3.to_wei(3 + attempt, "gwei")
             base_fee = w3.eth.get_block("latest").get("baseFeePerGas", 0) or w3.eth.gas_price
             max_fee = int(base_fee * (1 + (50 + attempt * 50) / 100)) + priority_fee
@@ -1499,16 +1519,20 @@ def attempt_buy(w3: Web3, token: str, fee: int, amount_eth: float, cfg: dict,
 
             print(f"Buy attempt {attempt+1}: amount={amount_eth} ETH, gas={gas}, maxFee={max_fee}, priority={priority_fee}")
 
-            # Optional: simulate first (best effort for sniping; send on last attempt even if fails)
+            # Simulate before sending — on force buy, report revert reason but still send
             try:
                 w3.eth.call({**tx, "from": sender}, "pending")
-            except Exception as e:
-                print(f"eth_call simulation revert: {e}")
-                if attempt < max_retries:
-                    continue  # retry with looser on early attempts
+            except Exception as sim_err:
+                sim_msg = str(sim_err)
+                print(f"eth_call simulation revert: {sim_msg}")
+                if force:
+                    tg_send(f"⚠️ <b>Simulation revert</b> (attempt {attempt+1}): <code>{sim_msg[:200]}</code>\n<i>Sending tx anyway (manual override)...</i>")
+                elif attempt < max_retries:
+                    continue  # retry with looser gas on early automated attempts
 
-            # Send the tx (even if sim failed on final attempt)
+            # Send the tx
             signed = account.sign_transaction(tx)
+
             try:
                 # record balance before for accurate net received (accounts for tax on transfer)
                 balance_before = 0
@@ -1604,15 +1628,18 @@ def attempt_buy(w3: Web3, token: str, fee: int, amount_eth: float, cfg: dict,
                 tg_send(f"❌ Buy error for {token}: {str(e)[:100]}")
                 traceback.print_exc()
 
-            # Per spec: if failed, retry immediately with higher gas / lower slippage (we already loosen on retry)
+            # Per spec: if failed, retry immediately with higher gas / lower slippage
             if attempt < max_retries:
                 time.sleep(0.5)
-                # Re-check liquidity still exists
-                if check_pool_liquidity(w3, pool) == 0:
+                # Re-check liquidity still exists (only if we know the pool)
+                if pool and check_pool_liquidity(w3, pool) == 0:
                     print("Liquidity disappeared. Aborting retries.")
                     break
+
         except Exception as e:
-            print(f"Buy loop error in attempt {attempt}: {e}")
+            err_msg = f"Buy loop error in attempt {attempt}: {e}"
+            print(err_msg)
+            tg_send(f"❌ <b>Buy error</b> (attempt {attempt+1}): <code>{str(e)[:200]}</code>")
             traceback.print_exc()
             break
 
