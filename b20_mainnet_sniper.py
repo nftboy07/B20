@@ -1962,13 +1962,11 @@ def attempt_sell(w3: Web3, token: str, fee: int, amount_token: int, cfg: dict, m
     slippage_bps = cfg.get("SLIPPAGE_BPS", 2000)
     min_out = int(amount_token * (10000 - slippage_bps) / 10000)  # rough for now
     router = get_router(w3)
-    deadline = int(time.time()) + 300
     params = {
         "tokenIn": to_checksum_address(token),
         "tokenOut": WETH,
         "fee": fee,
         "recipient": sender,
-        "deadline": deadline,
         "amountIn": amount_token,
         "amountOutMinimum": min_out,
         "sqrtPriceLimitX96": 0,
