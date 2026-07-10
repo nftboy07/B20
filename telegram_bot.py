@@ -90,6 +90,24 @@ def _get_w3():
         print(f"[TG] Failed to get rotating w3: {e}")
         return _current_w3
 
+async def _send_btn_reply(query, msg: str):
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    back_markup = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back to Menu", callback_data="menu")]])
+    try:
+        await query.edit_message_text(text=msg, reply_markup=back_markup, parse_mode="HTML")
+    except Exception as e:
+        try:
+            await query.edit_message_text(text=msg, reply_markup=back_markup)
+        except:
+            try:
+                await query.message.reply_text(text=msg, reply_markup=back_markup, parse_mode="HTML")
+            except:
+                try:
+                    await query.message.reply_text(text=msg, reply_markup=back_markup)
+                except:
+                    pass
+
+
 
 import time
 
@@ -1063,7 +1081,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             status_msg += f"(some data error: {e})\n"
         status_msg += "Use /positions /pnl etc for details. All data is LIVE mainnet."
-        await query.message.reply_text(status_msg)
+        await _send_btn_reply(query, status_msg)
 
     elif data == "pause":
         if _cfg:
@@ -1087,7 +1105,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             cached = _get_cached('pnl')
             if cached:
-                await query.message.reply_text(cached)
+                await _send_btn_reply(query, cached)
                 return
             from b20_mainnet_sniper import get_total_spent, get_estimated_portfolio_value, get_open_positions, get_win_rate
             def _compute_pnl():
@@ -1111,16 +1129,16 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             loop = asyncio.get_running_loop()
             msg = await loop.run_in_executor(None, _compute_pnl)
             _set_cached('pnl', msg)
-            await query.message.reply_text(msg)
+            await _send_btn_reply(query, msg)
         except Exception as e:
-            await query.message.reply_text(f"PnL error: {e}")
+            await _send_btn_reply(query, f"PnL error: {e}")
 
     elif data == "cmd_value":
         use_w3 = _get_w3()
         try:
             cached = _get_cached('portfolio_value')
             if cached is not None:
-                await query.message.reply_text(f"💰 REAL Est. portfolio value: {cached:.6f} ETH")
+                await _send_btn_reply(query, f"💰 REAL Est. portfolio value: {cached:.6f} ETH")
                 return
             from b20_mainnet_sniper import get_estimated_portfolio_value
             def _compute_value():
@@ -1128,17 +1146,17 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             loop = asyncio.get_running_loop()
             val = await loop.run_in_executor(None, _compute_value)
             _set_cached('portfolio_value', val)
-            await query.message.reply_text(f"💰 REAL Est. portfolio value: {val:.6f} ETH")
+            await _send_btn_reply(query, f"💰 REAL Est. portfolio value: {val:.6f} ETH")
         except Exception as e:
-            await query.message.reply_text(f"Value error: {e}")
+            await _send_btn_reply(query, f"Value error: {e}")
 
     elif data == "cmd_spent":
         try:
             from b20_mainnet_sniper import get_total_spent
             spent = get_total_spent()
-            await query.message.reply_text(f"💸 REAL Total ETH spent: {spent:.6f} ETH")
+            await _send_btn_reply(query, f"💸 REAL Total ETH spent: {spent:.6f} ETH")
         except Exception as e:
-            await query.message.reply_text(f"Spent error: {e}")
+            await _send_btn_reply(query, f"Spent error: {e}")
 
     elif data == "cmd_summary":
         use_w3 = _get_w3()
@@ -1160,7 +1178,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         eth = use_w3.eth.get_balance(sender) / 1e18
                     except: pass
                 msg = f"📋 SUMMARY (REAL, cached)\nWallet: {addr}\nETH bal: {eth:.4f}\nSpent: {spent:.4f}\nValue: {val:.4f}\nOpens: {opens}\nWinrate: {wr:.1f}%"
-                await query.message.reply_text(msg)
+                await _send_btn_reply(query, msg)
                 return
             from b20_mainnet_sniper import get_total_spent, get_estimated_portfolio_value, get_num_open_positions, get_win_rate, get_bot_address
             def _compute_summary():
@@ -1181,15 +1199,15 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg, spent, val = await loop.run_in_executor(None, _compute_summary)
             _set_cached('spent', spent)
             _set_cached('portfolio_value', val)
-            await query.message.reply_text(msg)
+            await _send_btn_reply(query, msg)
         except Exception as e:
-            await query.message.reply_text(f"Error: {e}")
+            await _send_btn_reply(query, f"Error: {e}")
 
     elif data == "cmd_positions":
         try:
             cached = _get_cached('positions')
             if cached:
-                await query.message.reply_text(cached)
+                await _send_btn_reply(query, cached)
                 return
             from b20_mainnet_sniper import get_open_positions
             def _compute_positions():
@@ -1216,9 +1234,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             loop = asyncio.get_running_loop()
             msg = await loop.run_in_executor(None, _compute_positions)
             _set_cached('positions', msg)
-            await query.message.reply_text(msg)
+            await _send_btn_reply(query, msg)
         except Exception as e:
-            await query.message.reply_text(f"Positions error: {e}")
+            await _send_btn_reply(query, f"Positions error: {e}")
 
     elif data == "cmd_gas":
         use_w3 = _get_w3()
@@ -1229,11 +1247,11 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     return get_gas_info(use_w3)
                 loop = asyncio.get_running_loop()
                 g = await loop.run_in_executor(None, _get_gas)
-                await query.message.reply_text(f"⛽ REAL Gas: {g.get('gas_price_gwei')} gwei | Base: {g.get('base_fee_gwei')} gwei")
+                await _send_btn_reply(query, f"⛽ REAL Gas: {g.get('gas_price_gwei')} gwei | Base: {g.get('base_fee_gwei')} gwei")
             except Exception as e:
-                await query.message.reply_text(f"Gas error: {e}")
+                await _send_btn_reply(query, f"Gas error: {e}")
         else:
-            await query.message.reply_text("No w3 context.")
+            await _send_btn_reply(query, "No w3 context.")
 
     elif data == "cmd_activation":
         use_w3 = _get_w3()
@@ -1244,19 +1262,19 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     return get_activation_status(use_w3)
                 loop = asyncio.get_running_loop()
                 res = await loop.run_in_executor(None, _get_act)
-                await query.message.reply_text(f"🔓 {res} (REAL on-chain)")
+                await _send_btn_reply(query, f"🔓 {res} (REAL on-chain)")
             except Exception as e:
-                await query.message.reply_text(f"Error: {e}")
+                await _send_btn_reply(query, f"Error: {e}")
         else:
-            await query.message.reply_text("No w3.")
+            await _send_btn_reply(query, "No w3.")
 
     elif data == "cmd_rpc":
         if _cfg:
             rpc = _cfg.get('RPC_URL', 'N/A')[:50]
             backups = len(_cfg.get('BACKUP_RPCS', []))
-            await query.message.reply_text(f"🌐 Current RPC: {rpc}...\nBackups: {backups} (real failover list)")
+            await _send_btn_reply(query, f"🌐 Current RPC: {rpc}...\nBackups: {backups} (real failover list)")
         else:
-            await query.message.reply_text("No config.")
+            await _send_btn_reply(query, "No config.")
 
     elif data == "cmd_history" or data == "cmd_recent":
         # real recent
@@ -1274,9 +1292,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 for ts, tok, act, amt, txh, st, acq in rows:
                     short_tok = (tok or "")[:8] + "..."
                     msg += f"{ts[:16]} {act} {short_tok} amt={amt} acq={acq:.2f} {st}\n"
-            await query.message.reply_text(msg)
+            await _send_btn_reply(query, msg)
         except Exception as e:
-            await query.message.reply_text(f"History error: {e}")
+            await _send_btn_reply(query, f"History error: {e}")
 
     elif data == "cmd_stats":
         try:
@@ -1284,9 +1302,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             st = get_detailed_stats()
             wr = get_win_rate()
             msg = f"📊 STATS (REAL)\nBuys: {st['successful_buys']}\nSpent: {st['total_spent']:.4f}\nSells: {st['sells']}\nWinrate: {wr:.1f}%"
-            await query.message.reply_text(msg)
+            await _send_btn_reply(query, msg)
         except Exception as e:
-            await query.message.reply_text(f"Stats error: {e}")
+            await _send_btn_reply(query, f"Stats error: {e}")
 
     elif data == "cmd_refresh":
         try:
@@ -1295,9 +1313,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return get_open_positions(_get_w3())
             loop = asyncio.get_running_loop()
             opens = await loop.run_in_executor(None, _get_opens)
-            await query.message.reply_text(f"🔄 Refreshed. {len(opens)} positions (real on-chain balances).")
+            await _send_btn_reply(query, f"🔄 Refreshed. {len(opens)} positions (real on-chain balances).")
         except Exception as e:
-            await query.message.reply_text(f"Refresh error: {e}")
+            await _send_btn_reply(query, f"Refresh error: {e}")
 
     elif data == "cmd_open":
         try:
@@ -1310,25 +1328,25 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 msg = "No open positions."
             else:
                 msg = "📂 Open (REAL):\n" + "\n".join([f"- {p.get('symbol','') or p['token'][:8]}... held:{p['held']:.2f}" for p in opens])
-            await query.message.reply_text(msg)
+            await _send_btn_reply(query, msg)
         except Exception as e:
-            await query.message.reply_text(f"Error: {e}")
+            await _send_btn_reply(query, f"Error: {e}")
 
     elif data == "cmd_export":
         try:
             from b20_mainnet_sniper import export_trades_csv
             ok = export_trades_csv("tg_export_trades.csv")
-            await query.message.reply_text("CSV exported (real DB)." if ok else "Export failed.")
+            await _send_btn_reply(query, "CSV exported (real DB)." if ok else "Export failed.")
         except Exception as e:
-            await query.message.reply_text(f"Error: {e}")
+            await _send_btn_reply(query, f"Error: {e}")
 
     elif data == "cmd_config":
         if _cfg:
             safe = {k: v for k, v in _cfg.items() if not any(x in k for x in ['KEY', 'TOKEN', 'RPC'])}
             msg = "⚙️ Config (REAL):\n" + "\n".join(f"{k}: {v}" for k, v in list(safe.items())[:10])
-            await query.message.reply_text(msg)
+            await _send_btn_reply(query, msg)
         else:
-            await query.message.reply_text("No config.")
+            await _send_btn_reply(query, "No config.")
 
     elif data == "cmd_liq":
         # For liq, if there are open positions, show for first one, else prompt
@@ -1349,9 +1367,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     return "Use /liq <token> for real liquidity (on-chain pool + price)"
             loop = asyncio.get_running_loop()
             msg = await loop.run_in_executor(None, _get_liq)
-            await query.message.reply_text(msg)
+            await _send_btn_reply(query, msg)
         except Exception as e:
-            await query.message.reply_text(f"Liq error: {e}. Use /liq <token>")
+            await _send_btn_reply(query, f"Liq error: {e}. Use /liq <token>")
 
     elif data == "cmd_simulate":
         try:
@@ -1370,9 +1388,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     return "Use /simulate <token> <eth> for real Quoter output"
             loop = asyncio.get_running_loop()
             msg = await loop.run_in_executor(None, _get_sim)
-            await query.message.reply_text(msg)
+            await _send_btn_reply(query, msg)
         except Exception as e:
-            await query.message.reply_text(f"Sim error: {e}")
+            await _send_btn_reply(query, f"Sim error: {e}")
 
     elif data == "cmd_safety":
         try:
@@ -1387,9 +1405,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     return "Use /safety <token> for real on-chain checks (liq, honeypot sim, etc)"
             loop = asyncio.get_running_loop()
             msg = await loop.run_in_executor(None, _get_safety)
-            await query.message.reply_text(msg)
+            await _send_btn_reply(query, msg)
         except Exception as e:
-            await query.message.reply_text(f"Safety error: {e}")
+            await _send_btn_reply(query, f"Safety error: {e}")
 
     elif data == "cmd_perftoken":
         try:
@@ -1406,32 +1424,32 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     return "Use /perftoken <token> for real per-token PnL"
             loop = asyncio.get_running_loop()
             msg = await loop.run_in_executor(None, _get_perf)
-            await query.message.reply_text(msg)
+            await _send_btn_reply(query, msg)
         except Exception as e:
-            await query.message.reply_text(f"Error: {e}")
+            await _send_btn_reply(query, f"Error: {e}")
 
     elif data == "cmd_addblack":
-        await query.edit_message_text("Use /addblack <token> to add (real blacklist update)")
+        await _send_btn_reply(query, "Use /addblack <token> to add (real blacklist update)")
     elif data == "cmd_remblack":
-        await query.edit_message_text("Use /remblack <token> to remove (real)")
+        await _send_btn_reply(query, "Use /remblack <token> to remove (real)")
 
     elif data == "cmd_balance":
-        await query.message.reply_text("Use /balance <token> for live on-chain balance (real).")
+        await _send_btn_reply(query, "Use /balance <token> for live on-chain balance (real).")
 
     elif data == "cmd_price":
-        await query.message.reply_text("Use /price <token> for live Quoter price (real mainnet).")
+        await _send_btn_reply(query, "Use /price <token> for live Quoter price (real mainnet).")
 
     elif data == "cmd_pools":
-        await query.message.reply_text("Use /pools <token> for real pool + liq info.")
+        await _send_btn_reply(query, "Use /pools <token> for real pool + liq info.")
 
     elif data == "cmd_tx":
-        await query.message.reply_text("Use /tx <hash> for real tx details + basescan link.")
+        await _send_btn_reply(query, "Use /tx <hash> for real tx details + basescan link.")
 
     elif data == "cmd_buy":
-        await query.message.reply_text("Use /buy <token> <eth> to manual buy (real tx). Example: /buy 0x... 0.003")
+        await _send_btn_reply(query, "Use /buy <token> <eth> to manual buy (real tx). Example: /buy 0x... 0.003")
 
     elif data == "cmd_sell":
-        await query.message.reply_text("Use /sell <token> <pct> or the TP buttons after buys. Uses live balance.")
+        await _send_btn_reply(query, "Use /sell <token> <pct> or the TP buttons after buys. Uses live balance.")
 
     elif data == "cmd_help" or data == "cmd_commands":
         await query.edit_message_text(
