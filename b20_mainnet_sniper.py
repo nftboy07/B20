@@ -158,8 +158,8 @@ UNISWAP_V3_ROUTER   = to_checksum_address("0x2626664c2603336E57B271c5C0b26F42174
 WETH                = to_checksum_address("0x4200000000000000000000000000000000000006")
 USDC                = to_checksum_address("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913")
 
-# Aerodrome support stub (for future multi-DEX #11). Use Uniswap V3 for now.
-# Real Aerodrome Factory on Base: 0x420DD381b31aEa2B3b2d6b8c5e9a6c5c5c5c5c5c (verify before full use)
+AERODROME_FACTORY   = to_checksum_address("0x420DD381b31aEf6683db6B902084cB0FFECe40Da")
+AERODROME_ROUTER    = to_checksum_address("0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43")
 
 # Uniswap V3 QuoterV2 on Base for accurate pricing (critical for real slippage)
 UNISWAP_QUOTER_V2   = to_checksum_address("0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a")
@@ -268,6 +268,88 @@ UNISWAP_V3_ROUTER_ABI = [
         "name": "exactInputSingle",
         "outputs": [{"internalType": "uint256", "name": "amountOut", "type": "uint256"}],
         "stateMutability": "payable",
+        "type": "function"
+    }
+]
+
+AERODROME_FACTORY_ABI = [
+    {
+        "inputs": [
+            {"internalType": "address", "name": "tokenA", "type": "address"},
+            {"internalType": "address", "name": "tokenB", "type": "address"},
+            {"internalType": "bool", "name": "stable", "type": "bool"}
+        ],
+        "name": "getPool",
+        "outputs": [{"internalType": "address", "name": "pool", "type": "address"}],
+        "stateMutability": "view",
+        "type": "function"
+    }
+]
+
+AERODROME_ROUTER_ABI = [
+    {
+        "inputs": [
+            {"internalType": "uint256", "name": "amountIn", "type": "uint256"},
+            {
+                "components": [
+                    {"internalType": "address", "name": "from", "type": "address"},
+                    {"internalType": "address", "name": "to", "type": "address"},
+                    {"internalType": "bool", "name": "stable", "type": "bool"},
+                    {"internalType": "address", "name": "factory", "type": "address"}
+                ],
+                "internalType": "struct IRouter.Route[]",
+                "name": "routes",
+                "type": "tuple[]"
+            }
+        ],
+        "name": "getAmountsOut",
+        "outputs": [{"internalType": "uint256[]", "name": "amounts", "type": "uint256[]"}],
+        "stateMutability": "view",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {"internalType": "uint256", "name": "amountOutMin", "type": "uint256"},
+            {
+                "components": [
+                    {"internalType": "address", "name": "from", "type": "address"},
+                    {"internalType": "address", "name": "to", "type": "address"},
+                    {"internalType": "bool", "name": "stable", "type": "bool"},
+                    {"internalType": "address", "name": "factory", "type": "address"}
+                ],
+                "internalType": "struct IRouter.Route[]",
+                "name": "routes",
+                "type": "tuple[]"
+            },
+            {"internalType": "address", "name": "to", "type": "address"},
+            {"internalType": "uint256", "name": "deadline", "type": "uint256"}
+        ],
+        "name": "swapExactETHForTokens",
+        "outputs": [{"internalType": "uint256[]", "name": "amounts", "type": "uint256[]"}],
+        "stateMutability": "payable",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {"internalType": "uint256", "name": "amountIn", "type": "uint256"},
+            {"internalType": "uint256", "name": "amountOutMin", "type": "uint256"},
+            {
+                "components": [
+                    {"internalType": "address", "name": "from", "type": "address"},
+                    {"internalType": "address", "name": "to", "type": "address"},
+                    {"internalType": "bool", "name": "stable", "type": "bool"},
+                    {"internalType": "address", "name": "factory", "type": "address"}
+                ],
+                "internalType": "struct IRouter.Route[]",
+                "name": "routes",
+                "type": "tuple[]"
+            },
+            {"internalType": "address", "name": "to", "type": "address"},
+            {"internalType": "uint256", "name": "deadline", "type": "uint256"}
+        ],
+        "name": "swapExactTokensForETH",
+        "outputs": [{"internalType": "uint256[]", "name": "amounts", "type": "uint256[]"}],
+        "stateMutability": "nonpayable",
         "type": "function"
     }
 ]
@@ -404,6 +486,16 @@ def load_active_positions_from_db() -> Dict[str, Dict]:
         print(f"[DB] load active positions error: {e}")
     return positions
 
+def get_pool_reserves_in_eth(w3: Web3, pool: str) -> float:
+    """Return the total WETH balance of the pool contract in ETH. DEX-agnostic."""
+    try:
+        weth_erc = w3.eth.contract(address=WETH, abi=ERC20_MIN_ABI)
+        bal = weth_erc.functions.balanceOf(to_checksum_address(pool)).call()
+        return bal / 1e18
+    except Exception as e:
+        print(f"Error querying pool WETH balance: {e}")
+        return 0.0
+
 FAILED_EXIT_ATTEMPTS = {}
 
 async def monitor_positions_loop(w3: Web3, cfg: dict):
@@ -456,6 +548,18 @@ async def monitor_positions_loop(w3: Web3, cfg: dict):
                             trigger_sell = True
                             reason = f"Trailing Stop Loss (-{tsl_pct:.1f}% from ATH, PnL +{pnl_pct:.1f}%)"
     
+                    # Active Rug Prevention check: query pool and check WETH balance
+                    try:
+                        res = find_best_pool(loop_w3, token)
+                        if res and res[0]:
+                            pool, dex_type, dex_param = res
+                            pool_weth = get_pool_reserves_in_eth(loop_w3, pool)
+                            if pool_weth < 0.1:
+                                trigger_sell = True
+                                reason = f"Liquidity Drain / Rug Detected ({pool_weth:.3f} ETH remaining)"
+                    except Exception as re:
+                        print(f"[MONITOR] Rug check error: {re}")
+
                     if not trigger_sell and age_minutes >= max_hold_minutes:
                         trigger_sell = True
                         reason = f"Time Limit Reached ({age_minutes:.1f} minutes hold)"
@@ -463,22 +567,25 @@ async def monitor_positions_loop(w3: Web3, cfg: dict):
                     if trigger_sell:
                         print(f"[MONITOR] Exiting position for {token}. Reason: {reason}")
                         tg_send(f"🚨 <b>Automated Exit Triggered</b> for {token}\nReason: {reason}\nAmount: {token_amount:.6f}")
-                        pool, actual_fee = find_best_pool(loop_w3, token)
-                        fee = actual_fee or 3000
-                        decimals = get_token_decimals(loop_w3, token)
-                        amount_wei = int(token_amount * (10 ** decimals))
-                        tx_hash = attempt_sell(loop_w3, token, fee, amount_wei, cfg)
-                        if tx_hash:
-                            ACTIVE_POSITIONS.pop(token, None)
-                            FAILED_EXIT_ATTEMPTS.pop(token, None)
-                        else:
-                            print(f"[MONITOR] Failed to sell position for {token}")
-                            FAILED_EXIT_ATTEMPTS[token] = FAILED_EXIT_ATTEMPTS.get(token, 0) + 1
-                            if FAILED_EXIT_ATTEMPTS[token] >= 3:
-                                print(f"[MONITOR] Too many failed exit attempts for {token}. Marking position as dead/rugged.")
-                                tg_send(f"⚠️ <b>Rugged / Liquidity Drained</b>: Too many failed exit attempts for {token}. Removing from active monitoring.")
+                        res = find_best_pool(loop_w3, token)
+                        if res and res[0]:
+                            pool, dex_type, dex_param = res
+                            decimals = get_token_decimals(loop_w3, token)
+                            amount_wei = int(token_amount * (10 ** decimals))
+                            tx_hash = attempt_sell(loop_w3, token, pool, dex_type, dex_param, amount_wei, cfg)
+                            if tx_hash:
                                 ACTIVE_POSITIONS.pop(token, None)
                                 FAILED_EXIT_ATTEMPTS.pop(token, None)
+                            else:
+                                print(f"[MONITOR] Failed to sell position for {token}")
+                                FAILED_EXIT_ATTEMPTS[token] = FAILED_EXIT_ATTEMPTS.get(token, 0) + 1
+                                if FAILED_EXIT_ATTEMPTS[token] >= 3:
+                                    print(f"[MONITOR] Too many failed exit attempts for {token}. Marking position as dead/rugged.")
+                                    tg_send(f"⚠️ <b>Rugged / Liquidity Drained</b>: Too many failed exit attempts for {token}. Removing from active monitoring.")
+                                    ACTIVE_POSITIONS.pop(token, None)
+                                    FAILED_EXIT_ATTEMPTS.pop(token, None)
+                        else:
+                            print(f"[MONITOR] No pool found for {token} exit.")
                 except Exception as token_err:
                     print(f"[MONITOR] Error checking token {token}: {token_err}")
 
@@ -683,11 +790,16 @@ def get_private_w3() -> Optional[Web3]:
     global private_w3
     if private_w3 is not None:
         return private_w3
-    flash_rpc = os.getenv("FLASHBOTS_RPC")
-    if flash_rpc:
+    # Support PRIVATE_RPC_URL (Base MEV protection), fallback to FLASHBOTS_RPC
+    priv_rpc = os.getenv("PRIVATE_RPC_URL") or os.getenv("FLASHBOTS_RPC")
+    if priv_rpc:
+        if "rpc.flashbots.net" in priv_rpc or "flashbots.net" in priv_rpc:
+            print("[PRIV] [WARN] FLASHBOTS_RPC / PRIVATE_RPC_URL is set to flashbots.net (Ethereum Mainnet). "
+                  "This will fail on Base Mainnet (Chain ID 8453) with signature verification errors. "
+                  "Please use a Base-specific MEV protected RPC (like Alchemy private RPC or dRPC MEV-protected endpoint).")
         try:
-            private_w3 = Web3(Web3.HTTPProvider(flash_rpc))
-            print(f"[PRIV] Initialized private RPC: {mask_sensitive(flash_rpc)}")
+            private_w3 = Web3(Web3.HTTPProvider(priv_rpc))
+            print(f"[PRIV] Initialized private RPC: {mask_sensitive(priv_rpc)}")
         except Exception as e:
             print(f"[PRIV] Failed to initialize private RPC: {e}")
     return private_w3
@@ -745,22 +857,31 @@ def get_win_rate() -> float:
         return 0.0
 
 def get_token_price_in_eth(w3, token):
-    """Real mainnet price: ETH per 1 token (via QuoterV2 or slot0).
+    """Real mainnet price: ETH per 1 token (via QuoterV2, slot0, or Aerodrome Router).
     Returns float ETH amount per full token unit. 0 if no liquidity / not quotable yet.
     """
     token = to_checksum_address(token)
+    
+    # 1. Try Aerodrome pricing first if pool is Aerodrome
+    try:
+        res = find_best_pool(w3, token)
+        if res and res[0] and res[1] == 'aerodrome':
+            pool, dex_type, stable = res
+            dec = get_token_decimals(w3, token)
+            one_token = 10 ** dec
+            router = w3.eth.contract(address=AERODROME_ROUTER, abi=AERODROME_ROUTER_ABI)
+            routes = [(token, WETH, stable, AERODROME_FACTORY)]
+            amounts = router.functions.getAmountsOut(one_token, routes).call()
+            return amounts[-1] / 1e18
+    except:
+        pass
+
+    # 2. Try Uniswap V3 QuoterV2
     try:
         dec = get_token_decimals(w3, token)
         one_token = 10 ** dec
         quoter = w3.eth.contract(address=UNISWAP_QUOTER_V2, abi=UNISWAP_QUOTER_V2_ABI)
-        # Quoter: sell 1 token for WETH (note order: tokenIn=token, tokenOut=WETH)
-        params = (
-            token,
-            WETH,
-            3000,
-            one_token,
-            0
-        )
+        params = (token, WETH, 3000, one_token, 0)
         quoted = quoter.functions.quoteExactInputSingle(params).call()
         amount_out = quoted[0] if isinstance(quoted, (list, tuple)) else quoted
         if amount_out and amount_out > 0:
@@ -768,42 +889,50 @@ def get_token_price_in_eth(w3, token):
     except Exception as qerr:
         pass  # common on brand new pools with no ticks crossed
 
-    # Robust slot0 price (works once pool has been initialized with first swap/liq)
+    # 3. Robust Uniswap slot0 price fallback
     try:
-        pool, _ = find_best_pool(w3, token)
-        if not pool:
+        res = find_best_pool(w3, token)
+        if not res or not res[0]:
             return 0.0
-        pool_contract = get_pool_contract(w3, pool)
-        slot0 = pool_contract.functions.slot0().call()
-        sqrt_price_x96 = slot0[0]
-        if sqrt_price_x96 == 0:
-            return 0.0
-        # Compute price of token in WETH
-        # price = (sqrtPX96 / 2**96)**2   is (token1/token0) or depending order
-        price_ratio = (sqrt_price_x96 / (2 ** 96)) ** 2
-        try:
-            t0 = to_checksum_address(pool_contract.functions.token0().call())
-            t1 = to_checksum_address(pool_contract.functions.token1().call())
-            # If token is token0, price_ratio = t1 / t0  => WETH per token if t1=WETH
-            # If token is token1, price_ratio = t1/t0  wait inverse: price_token_in_weth = 1/price_ratio if t0=weth
-            if t0 == WETH:
-                # token = t1, price_ratio = token / WETH  => ETH per token = 1 / price_ratio
-                eth_per_token = 1.0 / price_ratio if price_ratio > 0 else 0
-            elif t1 == WETH:
-                # token = t0, price_ratio = WETH / token   => eth_per = price_ratio
+        pool, dex_type, dex_param = res
+        if dex_type == 'uniswap_v3':
+            pool_contract = get_pool_contract(w3, pool)
+            slot0 = pool_contract.functions.slot0().call()
+            sqrt_price_x96 = slot0[0]
+            if sqrt_price_x96 == 0:
+                return 0.0
+            price_ratio = (sqrt_price_x96 / (2 ** 96)) ** 2
+            try:
+                t0 = to_checksum_address(pool_contract.functions.token0().call())
+                t1 = to_checksum_address(pool_contract.functions.token1().call())
+                if t0 == WETH:
+                    eth_per_token = 1.0 / price_ratio if price_ratio > 0 else 0
+                elif t1 == WETH:
+                    eth_per_token = price_ratio
+                else:
+                    eth_per_token = price_ratio
+            except:
                 eth_per_token = price_ratio
+            dec = get_token_decimals(w3, token)
+            eth_per_token *= (10 ** (dec - 18)) if dec != 18 else 1.0
+            return max(0.0, float(eth_per_token))
+        elif dex_type == 'aerodrome':
+            # Aerodrome reserves fallback
+            pool_contract = w3.eth.contract(address=pool, abi=[
+                {"inputs": [], "name": "getReserves", "outputs": [{"type": "uint256"}, {"type": "uint256"}, {"type": "uint32"}], "stateMutability": "view", "type": "function"},
+                {"inputs": [], "name": "token0", "outputs": [{"type": "address"}], "stateMutability": "view", "type": "function"},
+                {"inputs": [], "name": "token1", "outputs": [{"type": "address"}], "stateMutability": "view", "type": "function"},
+            ])
+            reserves = pool_contract.functions.getReserves().call()
+            t0 = pool_contract.functions.token0().call()
+            if t0.lower() == WETH.lower():
+                price = reserves[0] / reserves[1] if reserves[1] > 0 else 0.0
             else:
-                eth_per_token = price_ratio  # fallback guess
-        except:
-            eth_per_token = price_ratio
-        # Adjust for decimals difference (token decimals vs 18 for WETH)
-        dec = get_token_decimals(w3, token)
-        eth_per_token *= (10 ** (dec - 18)) if dec != 18 else 1.0   # rough; usually adjust inverse
-        # Note: for accurate often people use full math with decimal scaling on amounts.
-        # For display in TG this gives usable real number once pool active.
-        return max(0.0, float(eth_per_token))
-    except Exception as se:
-        return 0.0
+                price = reserves[1] / reserves[0] if reserves[0] > 0 else 0.0
+            return price
+    except:
+        pass
+    return 0.0
 
 def get_bot_address() -> str:
     """Return the address the bot is using."""
@@ -1598,41 +1727,122 @@ def find_or_wait_pool(w3: Web3, token_a: str, token_b: str, fee: int) -> Optiona
         return to_checksum_address(pool)
     return None
 
-def find_best_pool(w3: Web3, token: str) -> tuple[Optional[str], Optional[int]]:
-    """Try common fees to find a pool for the token (upgrade for reliable buys)."""
-    for fee in [3000, 10000, 500]:  # common fees, prioritize 3000
-        pool = find_or_wait_pool(w3, WETH, token, fee) or find_or_wait_pool(w3, token, WETH, fee)
-        if pool:
-            return pool, fee
+def find_aerodrome_pool(w3: Web3, token_a: str, token_b: str) -> tuple[Optional[str], Optional[bool]]:
+    """Query Aerodrome V2 Factory for stable and volatile pools."""
+    try:
+        factory = w3.eth.contract(address=AERODROME_FACTORY, abi=AERODROME_FACTORY_ABI)
+        # Check volatile first (standard for memes)
+        pool = factory.functions.getPool(to_checksum_address(token_a), to_checksum_address(token_b), False).call()
+        if pool and int(pool, 16) != 0:
+            return to_checksum_address(pool), False
+        # Check stable
+        pool = factory.functions.getPool(to_checksum_address(token_a), to_checksum_address(token_b), True).call()
+        if pool and int(pool, 16) != 0:
+            return to_checksum_address(pool), True
+    except:
+        pass
     return None, None
 
-def find_aerodrome_pool(w3: Web3, token_a: str, token_b: str) -> Optional[str]:
-    """Aerodrome support stub (upgrade #11). Currently falls back to Uniswap."""
-    return None
-
-def build_buy_tx(w3: Web3, token_out: str, fee: int, amount_in_wei: int, min_out: int, recipient: str) -> dict:
-    """Build exactInputSingle for buying token_out with ETH via SwapRouter02.
-
-    SwapRouter02 ExactInputSingleParams (selector 0x04e45aaf, NO deadline):
-      tokenIn, tokenOut, fee, recipient, amountIn, amountOutMinimum, sqrtPriceLimitX96
-    Send msg.value = amountIn; SwapRouter02 wraps ETH -> WETH internally.
+def find_best_pool(w3: Web3, token: str) -> tuple[Optional[str], Optional[str], Any]:
     """
-    router = get_router(w3)
-    params = {
-        "tokenIn": WETH,
-        "tokenOut": to_checksum_address(token_out),
-        "fee": fee,
-        "recipient": to_checksum_address(recipient),
-        "amountIn": amount_in_wei,
-        "amountOutMinimum": min_out,
-        "sqrtPriceLimitX96": 0,
-    }
-    tx = router.functions.exactInputSingle(params).build_transaction({
-        "from": recipient,
-        "value": amount_in_wei,   # ETH forwarded; SwapRouter02 wraps to WETH internally
-        "chainId": CHAIN_ID,
-    })
-    return tx
+    Smart Router Aggregator (Uniswap V3 + Aerodrome V2) (#60).
+    Finds pools on both DEXes, compares output quotes, and returns the best pool.
+    Returns: (pool_address, dex_type, dex_param)
+      - if uniswap_v3: dex_type='uniswap_v3', dex_param=fee (int)
+      - if aerodrome: dex_type='aerodrome', dex_param=stable (bool)
+    """
+    token = to_checksum_address(token)
+    
+    # 1. Query Uniswap V3 pools
+    uni_pool = None
+    uni_fee = 3000
+    for fee in [3000, 10000, 500]:
+        p = find_or_wait_pool(w3, WETH, token, fee) or find_or_wait_pool(w3, token, WETH, fee)
+        if p:
+            uni_pool = p
+            uni_fee = fee
+            break
+
+    # 2. Query Aerodrome pools
+    aero_pool, aero_stable = find_aerodrome_pool(w3, WETH, token)
+    if not aero_pool:
+        aero_pool, aero_stable = find_aerodrome_pool(w3, token, WETH)
+
+    # 3. Compare if both exist, otherwise return the one that exists
+    if uni_pool and aero_pool:
+        uni_quote = 0
+        aero_quote = 0
+        try:
+            dec = get_token_decimals(w3, token)
+            test_amount = 10 ** dec
+            
+            # Uniswap V3 quote
+            try:
+                quoter = w3.eth.contract(address=UNISWAP_QUOTER_V2, abi=UNISWAP_QUOTER_V2_ABI)
+                params = (token, WETH, uni_fee, test_amount, 0)
+                quoted = quoter.functions.quoteExactInputSingle(params).call()
+                uni_quote = quoted[0] if isinstance(quoted, (list, tuple)) else quoted
+            except:
+                pass
+                
+            # Aerodrome quote
+            try:
+                router = w3.eth.contract(address=AERODROME_ROUTER, abi=AERODROME_ROUTER_ABI)
+                routes = [(token, WETH, aero_stable, AERODROME_FACTORY)]
+                res = router.functions.getAmountsOut(test_amount, routes).call()
+                aero_quote = res[-1]
+            except:
+                pass
+        except:
+            pass
+            
+        if aero_quote > uni_quote:
+            return aero_pool, 'aerodrome', aero_stable
+        else:
+            return uni_pool, 'uniswap_v3', uni_fee
+            
+    elif uni_pool:
+        return uni_pool, 'uniswap_v3', uni_fee
+    elif aero_pool:
+        return aero_pool, 'aerodrome', aero_stable
+        
+    return None, None, None
+
+def build_buy_tx(w3: Web3, token_out: str, dex_type: str, dex_param: Any, amount_in_wei: int, min_out: int, recipient: str) -> dict:
+    """Build transaction for buying token_out with ETH via Uniswap V3 or Aerodrome V2."""
+    if dex_type == 'uniswap_v3':
+        router = get_router(w3)
+        params = {
+            "tokenIn": WETH,
+            "tokenOut": to_checksum_address(token_out),
+            "fee": dex_param,
+            "recipient": to_checksum_address(recipient),
+            "amountIn": amount_in_wei,
+            "amountOutMinimum": min_out,
+            "sqrtPriceLimitX96": 0,
+        }
+        tx = router.functions.exactInputSingle(params).build_transaction({
+            "from": recipient,
+            "value": amount_in_wei,   # ETH forwarded; SwapRouter02 wraps to WETH internally
+            "chainId": CHAIN_ID,
+        })
+        return tx
+    elif dex_type == 'aerodrome':
+        router = w3.eth.contract(address=AERODROME_ROUTER, abi=AERODROME_ROUTER_ABI)
+        routes = [(WETH, to_checksum_address(token_out), dex_param, AERODROME_FACTORY)]
+        deadline = int(time.time()) + 600
+        tx = router.functions.swapExactETHForTokens(
+            min_out,
+            routes,
+            to_checksum_address(recipient),
+            deadline
+        ).build_transaction({
+            "from": recipient,
+            "value": amount_in_wei,
+            "chainId": CHAIN_ID,
+        })
+        return tx
+    raise ValueError(f"Unknown dex_type: {dex_type}")
 
 def get_accurate_min_out(w3: Web3, token_out: str, fee: int, amount_in_wei: int, slippage_bps: int) -> int:
     """Use QuoterV2 for realistic amountOut, then apply slippage. Major upgrade for live trading."""
@@ -1704,21 +1914,21 @@ def attempt_buy(w3: Web3, token: str, fee: int, amount_eth: float, cfg: dict,
         return None
 
     # Pool discovery
-    pool, actual_fee = find_best_pool(w3, token)
-    if not pool:
+    res = find_best_pool(w3, token)
+    if not res or not res[0]:
         if force:
-            # Manual buy: try all fee tiers directly
-            tg_send(f"⚠️ <b>No pool found automatically</b> for <code>{token}</code>. Trying fee=3000 anyway...")
-            fee = fee or 3000
-            pool = None  # will attempt tx without liq check
+            # Manual buy fallback
+            tg_send(f"⚠️ <b>No pool found automatically</b> for <code>{token}</code>. Trying Uniswap V3 fee=3000 anyway...")
+            pool = None
+            dex_type = 'uniswap_v3'
+            dex_param = 3000
         else:
             msg = f"❌ No pool found for <code>{token}</code>. Buy aborted."
             print(msg)
             tg_send(msg)
             return None
     else:
-        if actual_fee is not None:
-            fee = actual_fee
+        pool, dex_type, dex_param = res
 
     # Liquidity check
     liq = 0
@@ -1753,29 +1963,40 @@ def attempt_buy(w3: Web3, token: str, fee: int, amount_eth: float, cfg: dict,
                 tg_send(f"🚫 <b>Buy Skipped</b>: Token <code>{token}</code> has active sandwich/front-run activity in the mempool.")
                 return None
 
-    print(f"Pool {pool} liquidity: {liq}. Proceeding with buy attempt. (fee={fee}, force={force})")
+    print(f"Pool {pool} liquidity: {liq}. Proceeding with buy attempt via {dex_type}. (force={force})")
 
     amount_in = w3.to_wei(amount_eth, "ether")
 
-
-    # Proper slippage from cfg + accurate quote (Quoter upgrade)
-    # Upgrade #42: dynamic slippage based on liq (deeper liq = tighter)
-    # For force buys with no pool / unknown liq, use wider slippage (5000bps) to avoid min_out revert
+    # Proper slippage from cfg + accurate quote
     if force and liq == 0:
         slippage_bps = 5000
-        min_out = get_accurate_min_out(w3, token, fee, amount_in, slippage_bps)
-        print(f"Force buy: widened slippage to {slippage_bps/100}% → min_out={min_out}")
     else:
         base_slip = cfg.get("SLIPPAGE_BPS", 2000)
         liq_eth = liq / 1e18 if liq else 0
         dyn_slip = max(500, min(base_slip, int(3000 - (liq_eth * 50))))
         slippage_bps = dyn_slip
-        min_out = get_accurate_min_out(w3, token, fee, amount_in, slippage_bps)
-        print(f"Using Quoter + dynamic slippage {slippage_bps/100}% (liq~{liq_eth:.1f} ETH) → min_out={min_out}")
+
+    # Calculate min_out dynamically
+    if dex_type == 'uniswap_v3':
+        min_out = get_accurate_min_out(w3, token, dex_param, amount_in, slippage_bps)
+    elif dex_type == 'aerodrome':
+        try:
+            router = w3.eth.contract(address=AERODROME_ROUTER, abi=AERODROME_ROUTER_ABI)
+            routes = [(WETH, token, dex_param, AERODROME_FACTORY)]
+            amounts = router.functions.getAmountsOut(amount_in, routes).call()
+            out_val = amounts[-1]
+            min_out = int(out_val * (10000 - slippage_bps) / 10000)
+        except Exception as ae:
+            print(f"[Aerodrome Quote] Failed: {ae}")
+            min_out = int(amount_in * (10000 - slippage_bps) / 10000)
+    else:
+        min_out = int(amount_in * (10000 - slippage_bps) / 10000)
+
+    print(f"Using dynamic slippage {slippage_bps/100}% → min_out={min_out}")
 
     for attempt in range(max_retries + 1):
         try:
-            tx = build_buy_tx(w3, token, fee, amount_in, min_out, sender)
+            tx = build_buy_tx(w3, token, dex_type, dex_param, amount_in, min_out, sender)
             # Randomize priority fee slightly (+0.1 to +0.5 Gwei) to prevent predictable gas signatures (upgrade #45)
             rand_offset_gwei = random.uniform(0.1, 0.5)
             priority_fee = w3.to_wei(3 + attempt + rand_offset_gwei, "gwei")
@@ -1928,8 +2149,8 @@ def attempt_buy(w3: Web3, token: str, fee: int, amount_eth: float, cfg: dict,
 
     return None
 
-def attempt_sell(w3: Web3, token: str, fee: int, amount_token: int, cfg: dict, max_retries: int = 1) -> Optional[str]:
-    """Basic sell logic for take profit or emergency. Uses exactInputSingle for token to ETH."""
+def attempt_sell(w3: Web3, token: str, pool: str, dex_type: str, dex_param: Any, amount_token: int, cfg: dict, max_retries: int = 1) -> Optional[str]:
+    """Sell logic supporting Uniswap V3 or Aerodrome V2 swaps."""
     if not amount_token or amount_token <= 0:
         return None
     global accounts_list
@@ -1960,15 +2181,17 @@ def attempt_sell(w3: Web3, token: str, fee: int, amount_token: int, cfg: dict, m
         return None
         
     sender = account.address
+    spender = UNISWAP_V3_ROUTER if dex_type == 'uniswap_v3' else AERODROME_ROUTER
+    spender_name = "SwapRouter02" if dex_type == 'uniswap_v3' else "Aerodrome Router"
     
     # Auto-approve router to spend tokens (upgrade execution path)
     try:
         erc = w3.eth.contract(address=to_checksum_address(token), abi=ERC20_MIN_ABI)
-        allowance = erc.functions.allowance(sender, UNISWAP_V3_ROUTER).call()
+        allowance = erc.functions.allowance(sender, spender).call()
         if allowance < amount_token:
-            print(f"[APPROVE] Approving {token} for SwapRouter02...")
+            print(f"[APPROVE] Approving {token} for {spender_name}...")
             approve_tx = erc.functions.approve(
-                UNISWAP_V3_ROUTER,
+                spender,
                 115792089237316195423570985008687907853269984665640564039457584007913129639935  # uint256 max
             ).build_transaction({
                 "from": sender,
@@ -1991,31 +2214,71 @@ def attempt_sell(w3: Web3, token: str, fee: int, amount_token: int, cfg: dict, m
         print(f"[APPROVE] Error in approval: {ae}")
         return None
 
-    pool = find_or_wait_pool(w3, token, WETH, fee) or find_or_wait_pool(w3, WETH, token, fee)
     if not pool:
         print("No pool for sell")
         return None
+
     # Use slippage from cfg
     slippage_bps = cfg.get("SLIPPAGE_BPS", 2000)
-    min_out = int(amount_token * (10000 - slippage_bps) / 10000)  # rough for now
-    router = get_router(w3)
-    params = {
-        "tokenIn": to_checksum_address(token),
-        "tokenOut": WETH,
-        "fee": fee,
-        "recipient": sender,
-        "amountIn": amount_token,
-        "amountOutMinimum": min_out,
-        "sqrtPriceLimitX96": 0,
-    }
-    try:
-        tx = router.functions.exactInputSingle(params).build_transaction({
-            "from": sender,
-            "chainId": CHAIN_ID,
-        })
-    except Exception as bte:
-        print(f"Failed to build sell transaction: {bte}")
-        return None
+    min_out = 0
+
+    if dex_type == 'uniswap_v3':
+        try:
+            quoter = w3.eth.contract(address=UNISWAP_QUOTER_V2, abi=UNISWAP_QUOTER_V2_ABI)
+            params = (token, WETH, dex_param, amount_token, 0)
+            quoted = quoter.functions.quoteExactInputSingle(params).call()
+            out_val = quoted[0] if isinstance(quoted, (list, tuple)) else quoted
+            min_out = int(out_val * (10000 - slippage_bps) / 10000)
+        except:
+            min_out = int(amount_token * (10000 - slippage_bps) / 10000)
+
+        router = get_router(w3)
+        params = {
+            "tokenIn": to_checksum_address(token),
+            "tokenOut": WETH,
+            "fee": dex_param,
+            "recipient": sender,
+            "amountIn": amount_token,
+            "amountOutMinimum": min_out,
+            "sqrtPriceLimitX96": 0,
+        }
+        try:
+            tx = router.functions.exactInputSingle(params).build_transaction({
+                "from": sender,
+                "chainId": CHAIN_ID,
+            })
+        except Exception as bte:
+            print(f"Failed to build sell transaction: {bte}")
+            return None
+
+    elif dex_type == 'aerodrome':
+        try:
+            router = w3.eth.contract(address=AERODROME_ROUTER, abi=AERODROME_ROUTER_ABI)
+            routes = [(token, WETH, dex_param, AERODROME_FACTORY)]
+            amounts = router.functions.getAmountsOut(amount_token, routes).call()
+            out_val = amounts[-1]
+            min_out = int(out_val * (10000 - slippage_bps) / 10000)
+        except:
+            min_out = int(amount_token * (10000 - slippage_bps) / 10000)
+
+        router = w3.eth.contract(address=AERODROME_ROUTER, abi=AERODROME_ROUTER_ABI)
+        routes = [(token, WETH, dex_param, AERODROME_FACTORY)]
+        deadline = int(time.time()) + 600
+        try:
+            tx = router.functions.swapExactTokensForETH(
+                amount_token,
+                min_out,
+                routes,
+                sender,
+                deadline
+            ).build_transaction({
+                "from": sender,
+                "chainId": CHAIN_ID,
+            })
+        except Exception as bte:
+            print(f"Failed to build sell transaction: {bte}")
+            return None
+
     priority_fee = w3.to_wei(2, "gwei")
     base_fee = w3.eth.get_block("latest").get("baseFeePerGas", 0) or w3.eth.gas_price
     max_fee = int(base_fee * (1 + 50 / 100)) + priority_fee
@@ -2024,7 +2287,7 @@ def attempt_sell(w3: Web3, token: str, fee: int, amount_token: int, cfg: dict, m
     tx["nonce"] = w3.eth.get_transaction_count(sender)
     gas = estimate_gas_with_buffer(w3, tx)
     tx["gas"] = gas
-    print(f"Sell attempt: amount_token={amount_token}")
+    print(f"Sell attempt ({dex_type}): amount_token={amount_token}")
     signed = account.sign_transaction(tx)
     try:
         tx_hash = send_raw_transaction_safe(w3, signed.raw_transaction)
