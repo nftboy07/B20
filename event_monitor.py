@@ -12,6 +12,7 @@ Advanced event detection:
 
 import asyncio
 import json
+import time
 from typing import Callable, Optional, Dict, List, Any
 from datetime import datetime, timezone
 from web3 import Web3
@@ -37,6 +38,7 @@ class EventMonitor:
         self.seen_pools = set()
         self.seen_tokens = set()
         self.pool_creation_times = {}  # pool_address -> timestamp
+        self.pool_liquidity = {}  # pool_address -> current_liquidity (amount uint128)
         
         # ABIs
         self.b20_factory_abi = [
@@ -106,7 +108,7 @@ class EventMonitor:
                     
                 except Exception as e:
                     logger.error(f"B20Created filter error: {e}")
-                    await asyncio.sleep(2)
+                    time.sleep(2)
         
         except Exception as e:
             logger.error(f"Failed to listen for B20Created: {e}")
@@ -161,7 +163,7 @@ class EventMonitor:
                 
                 except Exception as e:
                     logger.error(f"PoolCreated filter error: {e}")
-                    await asyncio.sleep(2)
+                    time.sleep(2)
         
         except Exception as e:
             logger.error(f"Failed to listen for PoolCreated: {e}")
@@ -285,6 +287,67 @@ class EventMonitor:
         """
         return abs(token_age_seconds - pool_age_seconds) < 2.0
 
+    # =========== LIQUIDITY MONITORING ===========
+    def listen_liquidity_events(self, callback: Callable) -> None:
+        """
+        Listen for Mint and Burn events from Uniswap V3 pools.
+        """
+        try:
+            mint_topic = "0x7a53080ba414158be7ec69b987b5fb7d07dee101fe85488f0853ae16239d0bde"
+            burn_topic = "0xcc1091283307613764841b5273397f26d7f8d6600c921319228807d925d48227"
+            
+            logger.info("Listening for Uniswap V3 Mint and Burn events...")
+            
+            last_block = self.w3.eth.block_number
+            while True:
+                try:
+                    current_block = self.w3.eth.block_number
+                    if current_block > last_block:
+                        logs = self.w3.eth.get_logs({
+                            "fromBlock": last_block + 1,
+                            "toBlock": current_block,
+                            "topics": [[mint_topic, burn_topic]]
+                        })
+                        for log in logs:
+                            pool = log['address']
+                            topic0 = log['topics'][0].hex()
+                            data = log['data']
+                            
+                            try:
+                                amount = int.from_bytes(data[0:32], 'big')
+                                amount0 = int.from_bytes(data[32:64], 'big')
+                                amount1 = int.from_bytes(data[64:96], 'big')
+                            except Exception:
+                                amount, amount0, amount1 = 0, 0, 0
+                                
+                            change_type = 'add' if topic0 == mint_topic else 'remove'
+                            
+                            # Update tracked liquidity
+                            current_liq = self.pool_liquidity.get(pool, 0)
+                            if change_type == 'add':
+                                self.pool_liquidity[pool] = current_liq + amount
+                            else:
+                                self.pool_liquidity[pool] = max(0, current_liq - amount)
+                                
+                            now = datetime.now(timezone.utc)
+                            callback('liquidity_change', {
+                                'pool_address': pool,
+                                'change_type': change_type,
+                                'amount': amount,
+                                'amount0': amount0,
+                                'amount1': amount1,
+                                'current_liquidity': self.pool_liquidity[pool],
+                                'timestamp': now.isoformat()
+                            })
+                            
+                        last_block = current_block
+                    time.sleep(2)
+                except Exception as e:
+                    logger.error(f"Liquidity monitor polling error: {e}")
+                    time.sleep(2)
+        except Exception as e:
+            logger.error(f"Failed to start liquidity monitor: {e}")
+
     # =========== EVENT AGGREGATION ===========
     def start_monitoring(self, callback: Callable) -> None:
         """
@@ -296,6 +359,7 @@ class EventMonitor:
         threads = [
             threading.Thread(target=self.listen_b20_created, args=(callback,), daemon=True),
             threading.Thread(target=self.listen_pool_created, args=(callback,), daemon=True),
+            threading.Thread(target=self.listen_liquidity_events, args=(callback,), daemon=True),
         ]
         
         for t in threads:
@@ -306,6 +370,6 @@ class EventMonitor:
         # Keep main thread alive
         try:
             while True:
-                asyncio.sleep(1)
+                time.sleep(1)
         except KeyboardInterrupt:
             logger.info("Monitoring stopped")

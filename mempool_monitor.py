@@ -196,7 +196,7 @@ class MempoolMonitor:
         except Exception as e:
             logger.debug(f"Error processing tx {tx_hash[:8]}: {e}")
 
-    def predict_token_address(self, data_hex: str) -> Optional[str]:
+    def predict_token_address(self, data_hex: str, deployer: str) -> Optional[str]:
         """Predict the address of the B20 token being created in this transaction."""
         try:
             if len(data_hex) < 10 or not data_hex.startswith("0x62975e6a"):  # createB20 selector
@@ -206,14 +206,13 @@ class MempoolMonitor:
             decoded = decode(['uint8', 'bytes32', 'bytes', 'bytes[]'], body)
             variant, salt, params, init_calls = decoded
             
-            # Call getB20Address on B20 Factory if available
+            # Call getB20Address on B20 Factory
             factory = self.w3.eth.contract(address=self.B20_FACTORY, abi=[
                 {
                     "inputs": [
                         {"name": "variant", "type": "uint8"},
-                        {"name": "salt", "type": "bytes32"},
-                        {"name": "params", "type": "bytes"},
-                        {"name": "initCalls", "type": "bytes[]"}
+                        {"name": "deployer", "type": "address"},
+                        {"name": "salt", "type": "bytes32"}
                     ],
                     "name": "getB20Address",
                     "outputs": [{"type": "address"}],
@@ -222,7 +221,7 @@ class MempoolMonitor:
                 }
             ])
             
-            predicted = factory.functions.getB20Address(variant, salt, params, init_calls).call()
+            predicted = factory.functions.getB20Address(variant, to_checksum_address(deployer), salt).call()
             return to_checksum_address(predicted)
         except Exception as e:
             logger.debug(f"Failed to predict token address: {e}")
@@ -237,7 +236,7 @@ class MempoolMonitor:
         logger.info(f"   Gas Price: {tx.get('gasPrice', 0) / 1e9:.2f} gwei")
         logger.info(f"   Function: {func_sig}")
         
-        predicted_token = self.predict_token_address(data)
+        predicted_token = self.predict_token_address(data, tx.get('from'))
         if predicted_token:
             logger.info(f"🔮 Predicted B20 Token Address: {predicted_token}")
             

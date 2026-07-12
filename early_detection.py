@@ -16,7 +16,36 @@ from datetime import datetime, timezone
 from typing import Dict, Callable, Optional, List, Set
 from dataclasses import dataclass
 
-from eth_utils import to_checksum_address
+from eth_utils import to_checksum_address, to_bytes, keccak
+import eth_abi
+
+def predict_create2_address(deployer: str, salt: bytes, bytecode_hash: bytes) -> str:
+    """
+    Predict address of contract deployed via CREATE2.
+    Formula: keccak256(0xff + deployer + salt + keccak256(bytecode))[12:]
+    """
+    deployer_bytes = to_bytes(hexstr=to_checksum_address(deployer))
+    preimage = b'\xff' + deployer_bytes + salt + bytecode_hash
+    hash_result = keccak(preimage)
+    return to_checksum_address(hash_result[12:])
+
+def predict_uniswap_v3_pool_address(
+    factory: str, token_a: str, token_b: str, fee: int,
+    init_code_hash: str = "0xe34f199b19b2b4f47f68442619d555527d244778a349b181734800e791054366"
+) -> str:
+    """Predict address of a Uniswap V3 pool before deployment."""
+    t0 = min(token_a.lower(), token_b.lower())
+    t1 = max(token_a.lower(), token_b.lower())
+    
+    encoded = eth_abi.encode(['address', 'address', 'uint24'], [to_checksum_address(t0), to_checksum_address(t1), fee])
+    salt = keccak(encoded)
+    
+    deployer_bytes = to_bytes(hexstr=to_checksum_address(factory))
+    bytecode_hash = to_bytes(hexstr=init_code_hash)
+    
+    preimage = b'\xff' + deployer_bytes + salt + bytecode_hash
+    hash_result = keccak(preimage)
+    return to_checksum_address(hash_result[12:])
 
 logger = logging.getLogger(__name__)
 

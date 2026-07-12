@@ -21,21 +21,41 @@
 
 ## ✅ IMPLEMENTED UPGRADES
 
+### Phase 1: Detection & Early Signals (1-20)
+- **#1**: B20Factory `B20Created` event monitoring
+- **#2**: Mempool monitoring via WebSocket
+- **#3**: Real-time B20 detection via `isB20`
+- **#4**: Monitor initial liquidity adds (exact amounts logged)
+- **#5**: Meme-like name/symbol filtering
+- **#10**: Stealth launch detection
+- **#11**: Other DEX support (Aerodrome, V2)
+- **#16**: Predict token address via getB20Address
+- **#19**: Copycat meme name detection
+
 ### Phase 2: Safety & Anti-Rug (21-40)
 - **#21**: Full honeypot simulation (buy + sell in eth_call)
 - **#22**: Mint authority + unlimited supply check
+- **#23**: LP locked/burned verification
 - **#24**: Holder distribution analysis (top 10 holders %)
 - **#25**: Buy/sell tax detection via roundtrip simulation
 - **#26**: Blacklist known rug wallets (integrated with risk manager)
+- **#28**: Non-upgradeable contract verification (proxy detection)
+- **#29**: Malicious pattern scanning (scam/impersonation checks)
+- **#30**: Auto-skip high dev wallet %
+- **#39**: Pool age minimum (30-60s) enforcement
 - **#40**: Safety score (0-100) system with weighted checks
 
 ### Phase 3: Execution & MEV (41-60)
 - **#41**: QuoterV2 integration for accurate quotes
 - **#42**: Dynamic slippage calculation based on liquidity depth
 - **#43**: Multi-path buying (parallel fee tier quotes)
+- **#44**: Private/builder RPC integration (Flashbots Protect)
+- **#45**: Front-run protection (gas randomization)
 - **#47**: Dynamic gas optimization using EIP-1559
 - **#51**: Retry logic with exponential backoff
 - **#52**: EIP-1559 maxFee/maxPriority calculation
+- **#54**: MEV protection (pending tx detection)
+- **#55**: Multi-wallet rotation
 
 ### Phase 4: Risk Management (61-75)
 - **#61**: Per-token position sizing based on liquidity
@@ -113,21 +133,14 @@
 ### Phase 1: Remaining Detection (1-20)
 - [ ] **#6**: Cross-pool arbitrage detection
 - [ ] **#7**: B20Factory salt prediction
-- [ ] **#11**: Other DEX support (Aerodrome, V2)
 - [ ] **#12**: On-chain social signal proxy
 - [ ] **#13**: Dev buy pattern detection
 - [ ] **#15**: Stablecoin B20 variant support
-- [ ] **#16**: Predict token address via getB20Address
 - [ ] **#17**: Multi-threaded async monitoring (optimization)
 - [ ] **#18**: Policy Registry changes subscription
-- [ ] **#19**: Copycat meme name detection
 
 ### Phase 2: Remaining Safety (21-40)
-- [ ] **#23**: LP locked/burned verification
 - [ ] **#27**: Transfer restrictions via Policy Registry
-- [ ] **#28**: Non-upgradeable contract verification
-- [ ] **#29**: Malicious pattern scanning
-- [ ] **#30**: Auto-skip high dev wallet %
 - [ ] **#31**: Team allocation + vesting detection
 - [ ] **#32**: Monitor large early sells
 - [ ] **#33**: Suspicious name/symbol detection
@@ -136,18 +149,13 @@
 - [ ] **#36**: Honeypot via failed sell simulation (alternative method)
 - [ ] **#37**: Liquidity removal event monitoring
 - [ ] **#38**: WETH pair verification
-- [ ] **#39**: Pool age minimum (30-60s) enforcement
 
 ### Phase 3: Remaining Execution (41-60)
-- [ ] **#44**: Private/builder RPC integration (Flashbots)
-- [ ] **#45**: Front-run protection (gas randomization)
 - [ ] **#46**: Atomic createB20 + liq + buy bundle
 - [ ] **#48**: Flash loan integration
 - [ ] **#49**: Atomic buy + partial sell (same tx)
 - [ ] **#50**: Limit orders / conditional buys
 - [ ] **#53**: Direct pool swaps (bypass router)
-- [ ] **#54**: MEV protection (pending tx detection)
-- [ ] **#55**: Multi-wallet rotation
 - [ ] **#56**: Buy in smaller chunks over time
 - [ ] **#57**: WETH pre-approval / permit support
 - [ ] **#58**: Avoid competing with known bots

@@ -496,6 +496,93 @@ def get_pool_reserves_in_eth(w3: Web3, pool: str) -> float:
         print(f"Error querying pool WETH balance: {e}")
         return 0.0
 
+def log_arbitrage_opportunity(token: str, uni_price: float, aero_price: float, diff_pct: float):
+    """Log an arbitrage opportunity to the database."""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS arbitrage_opportunities (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT,
+                token TEXT,
+                uni_price REAL,
+                aero_price REAL,
+                diff_pct REAL
+            )
+        """)
+        c.execute("""
+            INSERT INTO arbitrage_opportunities (timestamp, token, uni_price, aero_price, diff_pct)
+            VALUES (?, ?, ?, ?, ?)
+        """, (datetime.utcnow().isoformat(), token, uni_price, aero_price, diff_pct))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"[DB] Error logging arbitrage: {e}")
+
+def check_cross_pool_arbitrage(w3: Web3, token: str):
+    """Compare prices of a token between Uniswap V3 and Aerodrome V2 pools."""
+    try:
+        token = to_checksum_address(token)
+        # 1. Query Uniswap V3 price
+        uni_price = 0.0
+        try:
+            dec = get_token_decimals(w3, token)
+            one_token = 10 ** dec
+            quoter = w3.eth.contract(address=UNISWAP_QUOTER_V2, abi=UNISWAP_QUOTER_V2_ABI)
+            params = (token, WETH, 3000, one_token, 0)
+            quoted = quoter.functions.quoteExactInputSingle(params).call()
+            amount_out = quoted[0] if isinstance(quoted, (list, tuple)) else quoted
+            uni_price = amount_out / 1e18
+        except:
+            # Fallback to slot0
+            for fee in [3000, 10000, 500]:
+                p = find_or_wait_pool(w3, WETH, token, fee) or find_or_wait_pool(w3, token, WETH, fee)
+                if p:
+                    pool_contract = get_pool_contract(w3, p)
+                    slot0 = pool_contract.functions.slot0().call()
+                    sqrt_price_x96 = slot0[0]
+                    if sqrt_price_x96 > 0:
+                        price_ratio = (sqrt_price_x96 / (2 ** 96)) ** 2
+                        try:
+                            t0 = to_checksum_address(pool_contract.functions.token0().call())
+                            if t0 == WETH:
+                                uni_price = 1.0 / price_ratio if price_ratio > 0 else 0
+                            else:
+                                uni_price = price_ratio
+                        except:
+                            uni_price = price_ratio
+                        uni_price *= (10 ** (dec - 18)) if dec != 18 else 1.0
+                        break
+        
+        # 2. Query Aerodrome price
+        aero_price = 0.0
+        try:
+            aero_pool, aero_stable = find_aerodrome_pool(w3, WETH, token)
+            if not aero_pool:
+                aero_pool, aero_stable = find_aerodrome_pool(w3, token, WETH)
+            if aero_pool:
+                dec = get_token_decimals(w3, token)
+                one_token = 10 ** dec
+                router = w3.eth.contract(address=AERODROME_ROUTER, abi=AERODROME_ROUTER_ABI)
+                routes = [(token, WETH, aero_stable, AERODROME_FACTORY)]
+                amounts = router.functions.getAmountsOut(one_token, routes).call()
+                aero_price = amounts[-1] / 1e18
+        except:
+            pass
+
+        if uni_price > 0 and aero_price > 0:
+            diff_pct = abs(uni_price - aero_price) / min(uni_price, aero_price) * 100
+            if diff_pct >= 2.0:
+                print(f"[ARB] Arbitrage Opportunity for {token}: Uni={uni_price:.8f} ETH, Aero={aero_price:.8f} ETH, Diff={diff_pct:.2f}%")
+                log_arbitrage_opportunity(token, uni_price, aero_price, diff_pct)
+                tg_send(f"⚖️ <b>Arbitrage Spread Alert</b> for <code>{token}</code>:\n"
+                        f"• Uniswap V3: <code>{uni_price:.8f} ETH</code>\n"
+                        f"• Aerodrome: <code>{aero_price:.8f} ETH</code>\n"
+                        f"• Spread: <code>{diff_pct:.2f}%</code>")
+    except Exception as e:
+        print(f"[ARB] Error checking arbitrage: {e}")
+
 FAILED_EXIT_ATTEMPTS = {}
 
 async def monitor_positions_loop(w3: Web3, cfg: dict):
@@ -512,6 +599,7 @@ async def monitor_positions_loop(w3: Web3, cfg: dict):
                 try:
                     try:
                         current_price = get_token_price_in_eth(loop_w3, token)
+                        check_cross_pool_arbitrage(loop_w3, token)
                     except Exception:
                         current_price = 0
     
@@ -1375,9 +1463,149 @@ def get_activation_status(w3: Web3) -> str:
     except Exception as e:
         return f"Activation check error: {e}"
 
+def check_upgradeable_contract(w3: Web3, token: str) -> tuple[bool, str]:
+    """Safety #28: check if the token contract is upgradeable (proxy)."""
+    try:
+        token_addr = to_checksum_address(token)
+        
+        # 1. EIP-1967 implementation slot
+        eip1967_slot = "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc"
+        impl = w3.eth.get_storage_at(token_addr, eip1967_slot).hex()
+        if int(impl, 16) != 0:
+            return False, f"EIP-1967 proxy (impl: 0x{impl[-40:]})"
+            
+        # 2. EIP-1967 beacon slot
+        beacon_slot = "0xa3f0ad74e5423aebfd80d3ef4346578335a9a72aeaee59ff6cb3582b35133d50"
+        beacon = w3.eth.get_storage_at(token_addr, beacon_slot).hex()
+        if int(beacon, 16) != 0:
+            return False, "Beacon proxy"
+            
+        # 3. OZ proxy admin owner slot
+        oz_slot = "0x33b8a36f6d0f62ef1244fbe58467dfa811c7ff84752ca8cfa40a7cf59599574f"
+        oz_admin = w3.eth.get_storage_at(token_addr, oz_slot).hex()
+        if int(oz_admin, 16) != 0:
+            return False, "OZ proxy admin owner"
+            
+        # 4. Minimal Proxy (EIP-1167)
+        bytecode = w3.eth.get_code(token_addr).hex()
+        if bytecode.startswith("0x363d3d373d3d3d363d") or "363d3d373d3d3d363d" in bytecode[:30]:
+            return False, "EIP-1167 Minimal Proxy"
+            
+        # 5. Custom implementation() view function check
+        try:
+            impl_abi = [{"inputs": [], "name": "implementation", "outputs": [{"type": "address"}], "stateMutability": "view", "type": "function"}]
+            c = w3.eth.contract(address=token_addr, abi=impl_abi)
+            impl_addr = c.functions.implementation().call()
+            if impl_addr and int(impl_addr, 16) != 0:
+                return False, f"Custom proxy (impl: {impl_addr})"
+        except:
+            pass
+            
+        return True, "Non-upgradeable"
+    except Exception as e:
+        return True, f"Upgradeable check skipped: {str(e)[:50]}"
+
+def check_malicious_and_copycat_patterns(name: str, symbol: str) -> tuple[bool, str]:
+    """Safety #19, #29: scan token name and symbol for famous impersonations or malicious keywords."""
+    combined = f"{name} {symbol}".upper()
+    warnings = []
+    
+    # 1. Famous impersonations (upgrade #19)
+    famous_brands = ['ETHEREUM', 'BITCOIN', 'BINANCE', 'OPENSEA', 'METAMASK', 'UNISWAP', 'BASE', 'COINBASE', 'AERODROME']
+    for brand in famous_brands:
+        if brand in combined and not combined.startswith(brand + " "):
+            warnings.append(f"Impersonates {brand}")
+            
+    # 2. Formatting anomalies
+    if len(name) > 40:
+        warnings.append("Long name")
+    if symbol and len(symbol) > 10:
+        warnings.append("Long symbol")
+    if '0' in symbol and 'O' in symbol:
+        warnings.append("Confusing 0/O")
+        
+    # 3. Scam keywords (upgrade #29)
+    scam_words = ['FREE', 'GIFT', 'AIRDROP', 'REWARD', 'WINNER', 'CLAIM', 'TEST']
+    for word in scam_words:
+        if word in combined:
+            warnings.append(f"Scam word: {word}")
+            
+    if warnings:
+        return False, f"Impersonation/scam signs: {', '.join(warnings)}"
+        
+    return True, "Clean name/symbol"
+
+def check_cross_pool_arbitrage(w3: Web3, token: str, amount_eth: float = 1.0) -> dict:
+    """
+    Safety / Arbitrage #6: Check for cross-pool price discrepancies.
+    Compares quotes across 500 (0.05%), 3000 (0.3%), and 10000 (1%) fee tiers.
+    """
+    amount_in = w3.to_wei(amount_eth, 'ether')
+    quotes = {}
+    fees = [500, 3000, 10000]
+    
+    for fee in fees:
+        try:
+            quoter = w3.eth.contract(address=UNISWAP_QUOTER_V2, abi=UNISWAP_QUOTER_V2_ABI)
+            params = (
+                WETH,
+                to_checksum_address(token),
+                fee,
+                amount_in,
+                0
+            )
+            quoted = quoter.functions.quoteExactInputSingle(params).call()
+            amount_out = quoted[0] if isinstance(quoted, (list, tuple)) else quoted
+            if amount_out > 0:
+                quotes[fee] = amount_out
+        except Exception:
+            pass
+            
+    if len(quotes) < 2:
+        return {"opportunity": False, "reason": "Fewer than 2 pools active"}
+        
+    highest_fee = max(quotes, key=quotes.get)
+    lowest_fee = min(quotes, key=quotes.get)
+    
+    highest_out = quotes[highest_fee]
+    lowest_out = quotes[lowest_fee]
+    
+    spread_pct = ((highest_out - lowest_out) / lowest_out) * 100
+    
+    # Threshold for arbitrage (e.g., > 1.5%)
+    threshold = float(os.getenv("MIN_ARB_SPREAD_PCT", "1.5"))
+    opportunity = spread_pct >= threshold
+    
+    res = {
+        "opportunity": opportunity,
+        "spread_pct": round(spread_pct, 2),
+        "quotes": {f"{k}": v for k, v in quotes.items()},
+        "highest_fee": highest_fee,
+        "lowest_fee": lowest_fee,
+        "reason": f"Spread: {spread_pct:.2f}% (High: fee {highest_fee}, Low: fee {lowest_fee})"
+    }
+    
+    if opportunity:
+        print(f"[ARB ALERT] Cross-pool arbitrage found for {token}! {res['reason']}")
+        try:
+            tg_send(f"📊 <b>Arbitrage Signal!</b>\nToken: <code>{token}</code>\nSpread: <b>{spread_pct:.2f}%</b>\nHigh Out: fee {highest_fee} | Low Out: fee {lowest_fee}")
+        except:
+            pass
+            
+    return res
+
 def check_token_safety(w3: Web3, token: str, min_liq: float) -> tuple[bool, str]:
     """Enhanced safety checks to avoid honeypots, rugs, etc. Returns (is_safe, reason)"""
     try:
+        # === Pool Age check (upgrade #39) ===
+        min_age_secs = float(os.getenv("MIN_POOL_AGE_SECS", "30"))
+        if min_age_secs > 0:
+            first_seen = POOL_DETECTION_TIMES.get(token)
+            if first_seen:
+                age = time.time() - first_seen
+                if age < min_age_secs:
+                    return False, f"Pool is too new: {age:.1f}s < {min_age_secs}s"
+
         pool = find_or_wait_pool(w3, WETH, token, 3000) or find_or_wait_pool(w3, WETH, token, 10000)
         if not pool:
             return False, "No WETH pool found"
@@ -1440,6 +1668,17 @@ def check_token_safety(w3: Web3, token: str, min_liq: float) -> tuple[bool, str]
         if tax > 100:  # >1%
             safety_issues.append(f"High tax {tax}")
 
+        # Upgradeable / Proxy Check (upgrade #28)
+        safe, reason = check_upgradeable_contract(w3, token)
+        if not safe:
+            safety_issues.append(f"Proxy found: {reason}")
+
+        # Name/Symbol malicious pattern check (upgrade #19, #29)
+        name, symbol = get_token_name_symbol(w3, token)
+        safe, reason = check_malicious_and_copycat_patterns(name, symbol)
+        if not safe:
+            safety_issues.append(reason)
+
         if safety_issues:
             return False, f"Safety issues: {', '.join(safety_issues)}"
 
@@ -1449,6 +1688,14 @@ def check_token_safety(w3: Web3, token: str, min_liq: float) -> tuple[bool, str]
             safety_score += 10
         # Note: is_b20 and meme defined in caller scope; use try or pass
         print(f"[SAFETY SCORE] {token}: {safety_score}/100")
+
+        # Check cross-pool arbitrage spreads (upgrade #6)
+        try:
+            arb_res = check_cross_pool_arbitrage(w3, token)
+            if arb_res.get("opportunity"):
+                print(f"[SAFETY] Arbitrage spread warning: {arb_res['spread_pct']}% spread detected!")
+        except Exception as ae:
+            print(f"Error checking cross-pool arbitrage: {ae}")
 
         return True, f"Passed checks (score={safety_score})"
     except Exception as e:
@@ -1621,6 +1868,25 @@ def encode_simple_asset_params(name: str, symbol: str, admin: str, decimals: int
     version = b"\x00"
     encoded = encode(["string", "string", "address", "uint8"], [name, symbol, to_checksum_address(admin), decimals])
     return version + encoded
+
+def predict_b20_address(w3: Web3, tx_input: str, sender: str) -> Optional[str]:
+    """Predict the address of the B20 token being created using CREATE2 on B20Factory."""
+    try:
+        from eth_abi import decode
+        if not tx_input or len(tx_input) < 10:
+            return None
+        if not tx_input.startswith("0x62975e6a"):
+            return None
+        body = bytes.fromhex(tx_input[10:])
+        decoded = decode(['uint8', 'bytes32', 'bytes', 'bytes[]'], body)
+        variant, salt, params, init_calls = decoded
+        
+        factory = get_b20_factory(w3)
+        predicted = factory.functions.getB20Address(variant, to_checksum_address(sender), salt).call()
+        return to_checksum_address(predicted)
+    except Exception as e:
+        print(f"[PREDICT] Address prediction failed: {e}")
+        return None
 
 def simulate_create_b20(w3: Web3, variant: int, salt: bytes, params: bytes, init_calls: list[bytes]) -> dict:
     """Use eth_call at 'pending' to dry-run createB20."""
@@ -2579,18 +2845,26 @@ def main():
         if MEMPOOL_AVAILABLE and not dry_run:
             try:
                 def on_b20_mem(tx, txh, st, name="B20"):
-                    msg = f"🆕 <b>{name}</b> (MEMPOOL EARLY)\n<code>{tx.get('to', 'N/A')}</code>"
-                    buttons = get_buy_keyboard_dict(tx.get('to', '')) if TG_LIB_AVAILABLE else {
+                    predicted = tx.get('to')
+                    if not predicted or predicted == B20_FACTORY:
+                        predicted = predict_b20_address(w3, tx.get('input', ''), tx.get('from', ''))
+                    if not predicted:
+                        print("[MEMPOOL] Could not predict token address for B20 transaction.")
+                        return
+                    msg = f"🆕 <b>{name}</b> (MEMPOOL EARLY)\nPredicting token: <code>{predicted}</code>"
+                    print(f"[MEMPOOL] Detected pending B20 creation for token {predicted}")
+                    buttons = get_buy_keyboard_dict(predicted) if TG_LIB_AVAILABLE else {
                         "inline_keyboard": [
-                            [{"text": "0.003 ETH", "callback_data": f"buy_{tx.get('to', '')}_0.003"},
-                             {"text": "0.005 ETH", "callback_data": f"buy_{tx.get('to', '')}_0.005"}],
-                            [{"text": "0.007 ETH", "callback_data": f"buy_{tx.get('to', '')}_0.007"},
-                             {"text": "0.01 ETH", "callback_data": f"buy_{tx.get('to', '')}_0.01"}],
+                            [{"text": "0.003 ETH", "callback_data": f"buy_{predicted}_0.003"},
+                             {"text": "0.005 ETH", "callback_data": f"buy_{predicted}_0.005"}],
+                            [{"text": "0.007 ETH", "callback_data": f"buy_{predicted}_0.007"},
+                             {"text": "0.01 ETH", "callback_data": f"buy_{predicted}_0.01"}],
                         ]
                     }
                     tg_send(msg, reply_markup=buttons)
                     if not dry_run:
-                        attempt_buy(w3, tx.get('to', ''), 3000, 0.001, cfg)
+                        print(f"[MEMPOOL] Triggering early snipe buy attempt for token {predicted}...")
+                        attempt_buy(w3, predicted, 3000, 0.001, cfg)
                 ws_url = os.getenv("WEBSOCKET_RPC") or os.getenv("WS_RPC") or cfg.get("RPC_URL", "wss://base-mainnet.public.blastapi.io").replace("https://", "wss://")
                 if "mainnet.base.org" in ws_url:
                     ws_url = "wss://base.publicnode.com"

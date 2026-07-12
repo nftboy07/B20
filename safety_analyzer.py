@@ -339,6 +339,90 @@ class SafetyAnalyzer:
         except Exception as e:
             return (0, 0.0, f"Liquidity check failed: {str(e)[:50]}")
 
+    # =========== UPGRADEABLE / PROXY CHECK ===========
+    def check_upgradeable_contract(self, token_address: str) -> Tuple[int, str]:
+        """
+        Check if the token contract is upgradeable (proxy).
+        Returns: (score 0-100, reason)
+        """
+        try:
+            token_addr = to_checksum_address(token_address)
+            
+            # 1. EIP-1967 implementation slot
+            # keccak256("eip1967.proxy.implementation") - 1
+            eip1967_slot = "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc"
+            impl = self.w3.eth.get_storage_at(token_addr, eip1967_slot).hex()
+            if int(impl, 16) != 0:
+                return (0, f"Upgradeable EIP-1967 proxy (impl: 0x{impl[-40:]})")
+                
+            # 2. EIP-1967 beacon slot
+            # keccak256("eip1967.proxy.beacon") - 1
+            beacon_slot = "0xa3f0ad74e5423aebfd80d3ef4346578335a9a72aeaee59ff6cb3582b35133d50"
+            beacon = self.w3.eth.get_storage_at(token_addr, beacon_slot).hex()
+            if int(beacon, 16) != 0:
+                return (0, "Upgradeable Beacon proxy detected")
+                
+            # 3. OZ proxy admin owner slot
+            # keccak256("org.zeppelinos.proxy.owner")
+            oz_slot = "0x33b8a36f6d0f62ef1244fbe58467dfa811c7ff84752ca8cfa40a7cf59599574f"
+            oz_admin = self.w3.eth.get_storage_at(token_addr, oz_slot).hex()
+            if int(oz_admin, 16) != 0:
+                return (0, "Upgradeable OZ proxy admin owner detected")
+                
+            # 4. Minimal Proxy (EIP-1167)
+            bytecode = self.w3.eth.get_code(token_addr).hex()
+            if bytecode.startswith("0x363d3d373d3d3d363d") or "363d3d373d3d3d363d" in bytecode[:30]:
+                return (0, "Upgradeable EIP-1167 Minimal Proxy clone detected")
+                
+            # 5. Custom implementation() view function check
+            try:
+                impl_abi = [{"inputs": [], "name": "implementation", "outputs": [{"type": "address"}], "stateMutability": "view", "type": "function"}]
+                c = self.w3.eth.contract(address=token_addr, abi=impl_abi)
+                impl_addr = c.functions.implementation().call()
+                if impl_addr and int(impl_addr, 16) != 0:
+                    return (0, f"Upgradeable Custom proxy detected (impl: {impl_addr})")
+            except:
+                pass
+                
+            return (100, "Non-upgradeable (clean token contract)")
+            
+        except Exception as e:
+            return (90, f"Non-upgradeable check skipped: {str(e)[:50]}")
+
+    # =========== MALICIOUS PATTERNS / COPYCAT SCANNING ===========
+    def check_malicious_and_copycat_patterns(self, name: str, symbol: str) -> Tuple[int, str]:
+        """
+        Scan token name and symbol for famous impersonations or malicious keywords.
+        Returns: (score 0-100, reason)
+        """
+        combined = f"{name} {symbol}".upper()
+        warnings = []
+        
+        # 1. Famous impersonations
+        famous_brands = ['ETHEREUM', 'BITCOIN', 'BINANCE', 'OPENSEA', 'METAMASK', 'UNISWAP', 'BASE', 'COINBASE', 'AERODROME']
+        for brand in famous_brands:
+            if brand in combined and not combined.startswith(brand + " "):
+                warnings.append(f"Impersonates {brand}")
+                
+        # 2. Formatting anomalies
+        if len(name) > 40:
+            warnings.append("Long name (>40 chars)")
+        if symbol and len(symbol) > 10:
+            warnings.append("Long symbol (>10 chars)")
+        if '0' in symbol and 'O' in symbol:
+            warnings.append("Confusing 0/O chars")
+            
+        # 3. Scam keywords
+        scam_words = ['FREE', 'GIFT', 'AIRDROP', 'REWARD', 'WINNER', 'CLAIM', 'TEST']
+        for word in scam_words:
+            if word in combined:
+                warnings.append(f"Scam keyword: {word}")
+                
+        if warnings:
+            return (50 if len(warnings) == 1 else 20, f"Warnings: {', '.join(warnings)}")
+            
+        return (100, "Clean name and symbol parameters")
+
     # =========== SAFETY SCORE ===========
     def calculate_safety_score(
         self, token_address: str, pool_address: str, min_liquidity_eth: float = 5.0
@@ -379,17 +463,39 @@ class SafetyAnalyzer:
         scores['liquidity_reason'] = liq_reason
         scores['liquidity_eth'] = liq_eth
         
-        # Rug probability (inverse of mint + holder checks)
-        rug_probability = 100 - max(scores['mint_authority_score'], scores['holder_distribution_score'])
+        # Check 6: Upgradeable / Proxy Check
+        proxy_score, proxy_reason = self.check_upgradeable_contract(token_address)
+        scores['proxy_score'] = proxy_score
+        scores['proxy_reason'] = proxy_reason
+        
+        # Check 7: Name/Symbol malicious patterns
+        try:
+            abi = [
+                {"constant": True, "inputs": [], "name": "name", "outputs": [{"name": "", "type": "string"}], "type": "function"},
+                {"constant": True, "inputs": [], "name": "symbol", "outputs": [{"name": "", "type": "string"}], "type": "function"},
+            ]
+            c = self.w3.eth.contract(address=to_checksum_address(token_address), abi=abi)
+            name = c.functions.name().call()
+            symbol = c.functions.symbol().call()
+        except:
+            name, symbol = "Unknown", "UNK"
+        name_score, name_reason = self.check_malicious_and_copycat_patterns(name, symbol)
+        scores['name_score'] = name_score
+        scores['name_reason'] = name_reason
+        
+        # Rug probability (inverse of mint + holder + proxy checks)
+        rug_probability = 100 - min(scores['mint_authority_score'], scores['holder_distribution_score'], scores['proxy_score'])
         scores['rug_probability_score'] = min(rug_probability, 100)
         
         # Overall score (weighted average)
         weights = {
-            'honeypot_score': 0.25,
-            'mint_authority_score': 0.20,
-            'holder_distribution_score': 0.20,
+            'honeypot_score': 0.20,
+            'mint_authority_score': 0.15,
+            'holder_distribution_score': 0.15,
             'tax_score': 0.15,
-            'liquidity_score': 0.20
+            'liquidity_score': 0.15,
+            'proxy_score': 0.10,
+            'name_score': 0.10
         }
         
         overall = sum(scores[k] * v for k, v in weights.items())
@@ -412,5 +518,8 @@ class SafetyAnalyzer:
         
         if safety_scores.get('rug_probability_score', 0) > 70:
             return (False, "High rug probability")
+            
+        if safety_scores.get('proxy_score', 0) < 50:
+            return (False, f"Upgradeable proxy contract detected: {safety_scores.get('proxy_reason')}")
         
         return (True, f"Passed all checks (score: {overall})")
