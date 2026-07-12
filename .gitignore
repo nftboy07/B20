@@ -54,3 +54,7 @@ Thumbs.db
 
 # Misc
 *.bak
+
+# Databases
+*.db
+b20_trades.db
