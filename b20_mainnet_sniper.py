@@ -709,6 +709,7 @@ def load_config() -> Dict[str, Any]:
         # Telegram - support ethbot-style names + legacy
         "TELEGRAM_TOKEN": os.getenv("TELEGRAM_TOKEN") or os.getenv("BOT_TOKEN") or os.getenv("TG_BOT_TOKEN", ""),
         "ADMIN_CHAT_ID": os.getenv("ADMIN_CHAT_ID") or os.getenv("TELEGRAM_CHAT_ID") or os.getenv("TG_USER_ID", ""),
+        "ONLY_O1_LAUNCHPAD": os.getenv("ONLY_O1_LAUNCHPAD", "false").lower() == "true",
     }
     user_rpcs = [r.strip() for r in os.getenv("BACKUP_RPCS", "").split(",") if r.strip()]
     cfg["BACKUP_RPCS"] = user_rpcs + [r for r in DEFAULT_BASE_RPCS if r not in user_rpcs]  # user first, then defaults, no dups
@@ -2666,6 +2667,11 @@ def monitor_new_pools_and_snipe(w3: Web3, buy_amount_eth: float = 0.05, cfg: dic
                             continue
 
                         if new_token.lower().startswith("0xb20") or is_b20:
+                            is_o1 = new_token.lower().endswith("01")
+                            if cfg.get("ONLY_O1_LAUNCHPAD", False) and not is_o1:
+                                print(f"[O1 FILTER] Token {new_token} does not end with 01. Skipping as ONLY_O1_LAUNCHPAD is active.")
+                                continue
+
                             name, sym = get_token_name_symbol(w3, new_token)
                             meme = is_meme_like(name, sym)
                             print(f"Detected likely B20 token: {new_token} (isB20={is_b20}, meme_like={meme})")
@@ -2674,7 +2680,8 @@ def monitor_new_pools_and_snipe(w3: Web3, buy_amount_eth: float = 0.05, cfg: dic
                             initial_liq = check_pool_liquidity(w3, pool)
                             print(f"Initial liquidity add for {new_token}: {initial_liq} (pool {pool})")
 
-                            msg = f"🆕 <b>{name} ({sym})</b>\n<code>{new_token}</code>\nPool: <code>{pool}</code> fee={fee} liq={initial_liq} {'[MEME]' if meme else ''}"
+                            o1_tag = " ⚖️ <b>[o1.exchange Launchpad]</b>" if is_o1 else ""
+                            msg = f"🆕 <b>{name} ({sym})</b>{o1_tag}\n<code>{new_token}</code>\nPool: <code>{pool}</code> fee={fee} liq={initial_liq} {'[MEME]' if meme else ''}"
 
                             buttons = get_buy_keyboard_dict(new_token) if TG_LIB_AVAILABLE else {
                                 "inline_keyboard": [
@@ -2851,8 +2858,13 @@ def main():
                     if not predicted:
                         print("[MEMPOOL] Could not predict token address for B20 transaction.")
                         return
-                    msg = f"🆕 <b>{name}</b> (MEMPOOL EARLY)\nPredicting token: <code>{predicted}</code>"
-                    print(f"[MEMPOOL] Detected pending B20 creation for token {predicted}")
+                    is_o1 = predicted.lower().endswith("01")
+                    if cfg.get("ONLY_O1_LAUNCHPAD", False) and not is_o1:
+                        print(f"[O1 FILTER] Predicted token {predicted} does not end with 01. Skipping mempool snipe.")
+                        return
+                    tag = " [o1.exchange Launchpad]" if is_o1 else ""
+                    msg = f"🆕 <b>{name}</b> (MEMPOOL EARLY){tag}\nPredicting token: <code>{predicted}</code>"
+                    print(f"[MEMPOOL] Detected pending B20 creation for token {predicted}{' (o1.exchange Launchpad)' if is_o1 else ''}")
                     buttons = get_buy_keyboard_dict(predicted) if TG_LIB_AVAILABLE else {
                         "inline_keyboard": [
                             [{"text": "0.003 ETH", "callback_data": f"buy_{predicted}_0.003"},
