@@ -642,7 +642,13 @@ async def monitor_positions_loop(w3: Web3, cfg: dict):
                         if res and res[0]:
                             pool, dex_type, dex_param = res
                             pool_weth = get_pool_reserves_in_eth(loop_w3, pool)
-                            if pool_weth < 0.1:
+                            if pool_weth < 0.005:
+                                print(f"[MONITOR] Liquidity drained to zero ({pool_weth:.4f} ETH) for {token}. Skipping swap to save gas. Removing from monitoring.")
+                                tg_send(f"🚨 <b>Rugged (Zero Liquidity)</b> for {token}\nLiquidity has dropped to {pool_weth:.4f} ETH. Removing from active monitoring to save gas.")
+                                ACTIVE_POSITIONS.pop(token, None)
+                                FAILED_EXIT_ATTEMPTS.pop(token, None)
+                                continue
+                            elif pool_weth < 0.1:
                                 trigger_sell = True
                                 reason = f"Liquidity Drain / Rug Detected ({pool_weth:.3f} ETH remaining)"
                     except Exception as re:
