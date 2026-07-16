@@ -226,47 +226,143 @@ class SafetyAnalyzer:
         self, token_address: str, top_holders_count: int = 10
     ) -> Tuple[int, float, List[Tuple[str, float]]]:
         """
-        Analyze token holder distribution.
+        Analyze token holder distribution by scanning transfer logs.
         Returns: (score, top10_percent, [(holder_address, percent), ...])
         """
         try:
             token = self.w3.eth.contract(address=to_checksum_address(token_address), abi=self.TOKEN_ABI)
             
-            # Get total supply
             total_supply = token.functions.totalSupply().call()
             if total_supply == 0:
                 return (0, 100.0, [])
             
-            # Simulate top holders (in real implementation, need to scan events)
-            # For now, check dev wallet and known addresses
-            holders = []
-            dev_addresses = [
-                "0x0000000000000000000000000000000000000000",  # Burn
-                # Add other known addresses to check
-            ]
+            current_block = self.w3.eth.block_number
+            from_block = max(0, current_block - 2000)
             
-            top10_total = 0.0
-            for addr in dev_addresses:
+            transfer_topic = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+            logs = self.w3.eth.get_logs({
+                "fromBlock": from_block,
+                "toBlock": current_block,
+                "address": to_checksum_address(token_address),
+                "topics": [transfer_topic]
+            })
+            
+            balances = {}
+            for log in logs:
                 try:
-                    balance = token.functions.balanceOf(to_checksum_address(addr)).call()
-                    percent = (balance / total_supply * 100) if total_supply > 0 else 0
-                    if percent > 0:
-                        holders.append((addr[:10], percent))
-                        top10_total += percent
+                    frm = to_checksum_address("0x" + log["topics"][1].hex()[-40:])
+                    to = to_checksum_address("0x" + log["topics"][2].hex()[-40:])
+                    val = int(log["data"].hex(), 16) if isinstance(log["data"], bytes) else int(log["data"].hex(), 16)
+                    
+                    if frm != "0x0000000000000000000000000000000000000000":
+                        balances[frm] = balances.get(frm, 0) - val
+                    balances[to] = balances.get(to, 0) + val
                 except:
                     pass
             
-            # Score logic: <30% in top 10 = good
+            sorted_holders = []
+            for addr, bal in balances.items():
+                if bal > 0 and addr != "0x0000000000000000000000000000000000000000":
+                    pct = (bal / total_supply * 100) if total_supply > 0 else 0
+                    if pct > 0.01:
+                        # Check if holder is a contract (vesting/lock)
+                        try:
+                            code = self.w3.eth.get_code(addr)
+                            is_contract = len(code) > 2
+                        except:
+                            is_contract = False
+                        sorted_holders.append((addr, pct, is_contract))
+            
+            sorted_holders.sort(key=lambda x: x[1], reverse=True)
+            
+            # Sum top 10
+            top10_total = 0.0
+            holders = []
+            for item in sorted_holders[:top_holders_count]:
+                addr, pct, is_contract = item
+                label = f"{addr[:8]} (Contract/Vesting)" if is_contract else addr[:10]
+                holders.append((label, pct))
+                # Vesting contracts are safe team allocations - don't count them against dev centralization score
+                if not is_contract:
+                    top10_total += pct
+            
             score = 100 - int(min(top10_total, 100))
             if top10_total > 50:
-                score = 20  # Red flag
+                score = 20
             elif top10_total > 30:
                 score = 50
-            
+                
             return (score, top10_total, holders)
-        
         except Exception as e:
             return (0, 0.0, [(str(e)[:30], 0.0)])
+
+    def detect_dev_buy_patterns(self, token_address: str, deployer: str) -> Tuple[int, str]:
+        """Detect if the dev wallet funded buying immediately after launch."""
+        try:
+            token_addr = to_checksum_address(token_address)
+            dep_addr = to_checksum_address(deployer)
+            
+            token = self.w3.eth.contract(address=token_addr, abi=self.TOKEN_ABI)
+            total_supply = token.functions.totalSupply().call()
+            if total_supply == 0:
+                return (100, "Clean")
+                
+            current_block = self.w3.eth.block_number
+            from_block = max(0, current_block - 2000)
+            
+            transfer_topic = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+            logs = self.w3.eth.get_logs({
+                "fromBlock": from_block,
+                "toBlock": current_block,
+                "address": token_addr,
+                "topics": [transfer_topic]
+            })
+            
+            dev_buys = 0.0
+            for log in logs:
+                try:
+                    to = to_checksum_address("0x" + log["topics"][2].hex()[-40:])
+                    val = int(log["data"].hex(), 16) if isinstance(log["data"], bytes) else int(log["data"].hex(), 16)
+                    
+                    if to == dep_addr:
+                        dev_buys += val
+                except:
+                    pass
+            
+            pct = (dev_buys / total_supply * 100) if total_supply > 0 else 0
+            if pct > 15.0:
+                return (30, f"Dev bought {pct:.1f}% of supply immediately after launch")
+                
+            return (100, f"Clean (dev bought {pct:.1f}%)")
+        except Exception as e:
+            return (90, f"Dev buy check skipped: {str(e)[:50]}")
+
+    def find_token_deployer(self, token_address: str) -> Optional[str]:
+        """Query historical transactions or logs to find the token creator/deployer."""
+        try:
+            token_addr = to_checksum_address(token_address)
+            current_block = self.w3.eth.block_number
+            from_block = max(0, current_block - 2000)
+            
+            # Transfer topic
+            transfer_topic = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+            # Get earliest transfer from 0x00...00 (which is the mint/creation trace)
+            logs = self.w3.eth.get_logs({
+                "fromBlock": from_block,
+                "toBlock": current_block,
+                "address": token_addr,
+                "topics": [
+                    transfer_topic,
+                    "0x0000000000000000000000000000000000000000000000000000000000000000"
+                ]
+            })
+            if logs:
+                # The recipient of the first mint is usually the creator or creator contract
+                to_addr = to_checksum_address("0x" + logs[0]["topics"][2].hex()[-40:])
+                return to_addr
+        except:
+            pass
+        return None
 
     # =========== BUY/SELL TAX ===========
     def detect_buy_sell_tax(
@@ -501,6 +597,15 @@ class SafetyAnalyzer:
         overall = sum(scores[k] * v for k, v in weights.items())
         scores['overall_score'] = int(overall)
         
+        # Check 8: Dev buy patterns
+        dev_address = self.find_token_deployer(token_address)
+        if dev_address:
+            dev_buy_score, dev_buy_reason = self.detect_dev_buy_patterns(token_address, dev_address)
+        else:
+            dev_buy_score, dev_buy_reason = 100, "Could not locate deployer address"
+        scores['dev_buy_score'] = dev_buy_score
+        scores['dev_buy_reason'] = dev_buy_reason
+        
         return scores
 
     def should_buy(self, safety_scores: Dict, min_safety_score: int = 75) -> Tuple[bool, str]:
@@ -521,5 +626,8 @@ class SafetyAnalyzer:
             
         if safety_scores.get('proxy_score', 0) < 50:
             return (False, f"Upgradeable proxy contract detected: {safety_scores.get('proxy_reason')}")
+            
+        if safety_scores.get('dev_buy_score', 0) < 50:
+            return (False, f"Dev centralization risk: {safety_scores.get('dev_buy_reason')}")
         
         return (True, f"Passed all checks (score: {overall})")

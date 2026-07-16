@@ -583,11 +583,31 @@ def check_cross_pool_arbitrage(w3: Web3, token: str):
     except Exception as e:
         print(f"[ARB] Error checking arbitrage: {e}")
 
+def check_pool_burn_events(w3: Web3, pool: str, from_block: int, to_block: int, dex_type: str) -> bool:
+    """Check if any Burn / RemoveLiquidity event was emitted on the pool in the block range."""
+    try:
+        pool_addr = to_checksum_address(pool)
+        # Uni V3 Burn vs Aero V2 Burn topic
+        topic = "0x0c396cd989a39f4459b5fa1aed6a9a8dcdbc45908acfd67e028cd568da98982c" if dex_type == "uniswap_v3" else "0xdccd412f0b1252819cb1fd330b93224ca42612892bb3f4f789976e6d81936496"
+        logs = w3.eth.get_logs({
+            "fromBlock": from_block,
+            "toBlock": to_block,
+            "address": pool_addr,
+            "topics": [topic]
+        })
+        if logs:
+            print(f"[BURN MONITOR] Detected burn/remove liquidity event in block range {from_block}-{to_block} for pool {pool}")
+            return True
+    except Exception as e:
+        print(f"[BURN MONITOR] Error checking events: {e}")
+    return False
+
 FAILED_EXIT_ATTEMPTS = {}
 
 async def monitor_positions_loop(w3: Web3, cfg: dict):
     print("[MONITOR] Starting active position monitoring loop...")
     rpc_list = cfg.get("BACKUP_RPCS", DEFAULT_BASE_RPCS)
+    last_block_checked = 0
     while True:
         try:
             # rotate RPC each iteration to distribute load across endpoints
@@ -595,6 +615,12 @@ async def monitor_positions_loop(w3: Web3, cfg: dict):
                 loop_w3 = get_best_w3(rpc_list)
             except Exception:
                 loop_w3 = w3  # fallback to original
+            
+            try:
+                current_block = loop_w3.eth.block_number
+            except Exception:
+                current_block = 0
+
             for token, pos in list(ACTIVE_POSITIONS.items()):
                 try:
                     try:
@@ -635,29 +661,34 @@ async def monitor_positions_loop(w3: Web3, cfg: dict):
                         elif tsl_pct >= tsl_limit_pct and pnl_pct > 0:
                             trigger_sell = True
                             reason = f"Trailing Stop Loss (-{tsl_pct:.1f}% from ATH, PnL +{pnl_pct:.1f}%)"
-    
-                    # Active Rug Prevention check: query pool and check WETH balance
                     try:
                         res = find_best_pool(loop_w3, token)
                         if res and res[0]:
                             pool, dex_type, dex_param = res
-                            pool_weth = get_pool_reserves_in_eth(loop_w3, pool)
-                            if pool_weth < 0.005:
-                                print(f"[MONITOR] Liquidity drained to zero ({pool_weth:.4f} ETH) for {token}. Skipping swap to save gas. Removing from monitoring.")
-                                tg_send(f"🚨 <b>Rugged (Zero Liquidity)</b> for {token}\nLiquidity has dropped to {pool_weth:.4f} ETH. Removing from active monitoring to save gas.")
-                                ACTIVE_POSITIONS.pop(token, None)
-                                FAILED_EXIT_ATTEMPTS.pop(token, None)
-                                continue
-                            elif pool_weth < 0.1:
-                                trigger_sell = True
-                                reason = f"Liquidity Drain / Rug Detected ({pool_weth:.3f} ETH remaining)"
+                            # Real-time Liquidity Removal Monitoring (#37)
+                            if last_block_checked > 0 and current_block > last_block_checked:
+                                if check_pool_burn_events(loop_w3, pool, last_block_checked + 1, current_block, dex_type):
+                                    trigger_sell = True
+                                    reason = "Real-time Liquidity Burn Event Detected"
+                            
+                            if not trigger_sell:
+                                pool_weth = get_pool_reserves_in_eth(loop_w3, pool)
+                                if pool_weth < 0.005:
+                                    print(f"[MONITOR] Liquidity drained to zero ({pool_weth:.4f} ETH) for {token}. Skipping swap to save gas. Removing from monitoring.")
+                                    tg_send(f"🚨 <b>Rugged (Zero Liquidity)</b> for {token}\nLiquidity has dropped to {pool_weth:.4f} ETH. Removing from active monitoring to save gas.")
+                                    ACTIVE_POSITIONS.pop(token, None)
+                                    FAILED_EXIT_ATTEMPTS.pop(token, None)
+                                    continue
+                                elif pool_weth < 0.1:
+                                    trigger_sell = True
+                                    reason = f"Liquidity Drain / Rug Detected ({pool_weth:.3f} ETH remaining)"
                     except Exception as re:
                         print(f"[MONITOR] Rug check error: {re}")
-
+ 
                     if not trigger_sell and age_minutes >= max_hold_minutes:
                         trigger_sell = True
                         reason = f"Time Limit Reached ({age_minutes:.1f} minutes hold)"
-    
+     
                     if trigger_sell:
                         print(f"[MONITOR] Exiting position for {token}. Reason: {reason}")
                         tg_send(f"🚨 <b>Automated Exit Triggered</b> for {token}\nReason: {reason}\nAmount: {token_amount:.6f}")
@@ -682,7 +713,10 @@ async def monitor_positions_loop(w3: Web3, cfg: dict):
                             print(f"[MONITOR] No pool found for {token} exit.")
                 except Exception as token_err:
                     print(f"[MONITOR] Error checking token {token}: {token_err}")
-
+ 
+            if current_block > 0:
+                last_block_checked = current_block
+ 
             await asyncio.sleep(15)  # 15s between checks — less RPC pressure
         except Exception as e:
             print(f"[MONITOR] Position loop error: {e}")
@@ -2650,12 +2684,16 @@ def monitor_new_pools_and_snipe(w3: Web3, buy_amount_eth: float = 0.05, cfg: dic
                         print(f"PoolCreated: {token0} / {token1} fee={fee} pool={pool}")
 
                         new_token = None
-                        if token0.lower() != WETH.lower() and token0.lower() != USDC.lower():
-                            new_token = token0
-                        elif token1.lower() != WETH.lower() and token1.lower() != USDC.lower():
+                        pairing_asset = None
+                        if token0.lower() == WETH.lower() or token0.lower() == USDC.lower():
                             new_token = token1
+                            pairing_asset = token0
+                        elif token1.lower() == WETH.lower() or token1.lower() == USDC.lower():
+                            new_token = token0
+                            pairing_asset = token1
 
-                        if not new_token:
+                        if not new_token or not pairing_asset:
+                            print(f"[PAIR FILTER] Skipping pool {pool}: neither token is WETH or USDC")
                             continue
 
                         if new_token not in POOL_DETECTION_TIMES:
