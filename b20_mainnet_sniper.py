@@ -1134,6 +1134,9 @@ def get_open_positions(w3=None, include_price=True) -> list:
         if not rows:
             return positions
             
+        cfg = load_config()
+        rpc_list = cfg.get("BACKUP_RPCS", DEFAULT_BASE_RPCS)
+            
         senders = []
         if w3:
             global accounts_list
@@ -1162,8 +1165,11 @@ def get_open_positions(w3=None, include_price=True) -> list:
             
             if w3 and senders:
                 try:
+                    # Distribute queries across multiple RPC endpoints using round-robin to avoid 429/403 blocks
+                    thread_w3 = get_best_w3(rpc_list)
+                    
                     # 1. Fetch decimals (cached or RPC)
-                    dec = get_token_decimals(w3, token)
+                    dec = get_token_decimals(thread_w3, token)
                     
                     # 2. Fetch symbol (cached or RPC)
                     t_lower = token.lower()
@@ -1171,14 +1177,14 @@ def get_open_positions(w3=None, include_price=True) -> list:
                         sym = TOKEN_SYMBOL_CACHE[t_lower]
                     else:
                         try:
-                            erc_sym = w3.eth.contract(address=to_checksum_address(token), abi=ERC20_MIN_ABI)
+                            erc_sym = thread_w3.eth.contract(address=to_checksum_address(token), abi=ERC20_MIN_ABI)
                             sym = erc_sym.functions.symbol().call()
                             TOKEN_SYMBOL_CACHE[t_lower] = sym
                         except:
                             sym = "?"
                             
                     # 3. Fetch balances across all sender addresses
-                    erc = w3.eth.contract(address=to_checksum_address(token), abi=ERC20_MIN_ABI)
+                    erc = thread_w3.eth.contract(address=to_checksum_address(token), abi=ERC20_MIN_ABI)
                     held = 0
                     for s in senders:
                         try:
@@ -1190,7 +1196,7 @@ def get_open_positions(w3=None, include_price=True) -> list:
                     # 4. Fetch price ONLY if balance is > 0 and include_price is True
                     if include_price and held_human > 0:
                         try:
-                            price = get_token_price_in_eth(w3, token)
+                            price = get_token_price_in_eth(thread_w3, token)
                             value = held_human * price
                             pnl = value - (eth_spent or 0)
                             pnl_pct = (pnl / (eth_spent or 1) * 100) if eth_spent else 0

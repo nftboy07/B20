@@ -311,8 +311,11 @@ async def positions_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 msg += f"  Spent: {spent:.6f} ETH\n"
                 if ep > 0:
                     msg += f"  Entry price: {ep:.10f} ETH/token\n"
-                if val > 0:
-                    msg += f"  Value: {val:.6f} PnL: {p.get('pnl_eth',0):.6f} ({p.get('pnl_pct',0):.1f}%)\n"
+                pnl_eth = p.get('pnl_eth', 0.0)
+                pnl_pct = p.get('pnl_pct', 0.0)
+                price = p.get('price_eth', 0.0)
+                if price > 0 or spent > 0:
+                    msg += f"  Value: {val:.6f} ETH | PnL: {pnl_eth:.6f} ETH ({pnl_pct:.1f}%)\n"
                 else:
                     msg += "  Value/PnL: N/A (price pending)\n"
                 if acq == 0 and spent > 0:
@@ -1221,9 +1224,11 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     msg += f"{label}\n  Acquired: {p.get('acquired',0):.6f} Held: {p.get('held',0):.6f}\n  Spent: {p.get('eth_spent',0):.6f}\n"
                     if p.get('entry_price_eth', 0) > 0:
                         msg += f"  Entry: {p['entry_price_eth']:.10f} ETH/token\n"
-                    val = p.get('value_eth', 0)
-                    if val > 0:
-                        msg += f"  Value: {val:.6f} PnL: {p.get('pnl_eth',0):.6f}\n"
+                    pnl_eth = p.get('pnl_eth', 0.0)
+                    price = p.get('price_eth', 0.0)
+                    spent = p.get('eth_spent', 0.0)
+                    if price > 0 or spent > 0:
+                        msg += f"  Value: {val:.6f} | PnL: {pnl_eth:.6f}\n"
                     else:
                         msg += "  Value/PnL: N/A (fresh token)\n"
                     if p.get('note'):
