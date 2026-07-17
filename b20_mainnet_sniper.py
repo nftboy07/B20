@@ -169,8 +169,9 @@ FEATURE_B20_ASSET      = keccak(text="base.b20_asset")
 FEATURE_B20_STABLECOIN = keccak(text="base.b20_stablecoin")
 
 # Common fee tiers (do not filter; buy any)
-UNISWAP_FEE_TIERS = [500, 3000, 10000]
+UNISWAP_FEE_TIERS = [100, 500, 3000, 10000]
 POOL_DETECTION_TIMES = {}
+PENDING_POOLS_TO_RETRY = {}
 
 # Activation time (do not hardcode logic that bypasses the on-chain check)
 ACTIVATION_UTC = datetime(2026, 7, 8, 18, 0, 0, tzinfo=timezone.utc)
@@ -536,7 +537,7 @@ def check_cross_pool_arbitrage(w3: Web3, token: str):
             uni_price = amount_out / 1e18
         except:
             # Fallback to slot0
-            for fee in [3000, 10000, 500]:
+            for fee in [100, 500, 3000, 10000]:
                 p = find_or_wait_pool(w3, WETH, token, fee) or find_or_wait_pool(w3, token, WETH, fee)
                 if p:
                     pool_contract = get_pool_contract(w3, p)
@@ -676,6 +677,7 @@ async def monitor_positions_loop(w3: Web3, cfg: dict):
                                 if pool_weth < 0.005:
                                     print(f"[MONITOR] Liquidity drained to zero ({pool_weth:.4f} ETH) for {token}. Skipping swap to save gas. Removing from monitoring.")
                                     tg_send(f"🚨 <b>Rugged (Zero Liquidity)</b> for {token}\nLiquidity has dropped to {pool_weth:.4f} ETH. Removing from active monitoring to save gas.")
+                                    log_trade(token, "sell", 0.0, "RUG_ZERO_LIQ", "success", token_amount)
                                     ACTIVE_POSITIONS.pop(token, None)
                                     FAILED_EXIT_ATTEMPTS.pop(token, None)
                                     continue
@@ -707,6 +709,7 @@ async def monitor_positions_loop(w3: Web3, cfg: dict):
                                 if FAILED_EXIT_ATTEMPTS[token] >= 3:
                                     print(f"[MONITOR] Too many failed exit attempts for {token}. Marking position as dead/rugged.")
                                     tg_send(f"⚠️ <b>Rugged / Liquidity Drained</b>: Too many failed exit attempts for {token}. Removing from active monitoring.")
+                                    log_trade(token, "sell", 0.0, "RUG_FAILED_EXITS", "success", token_amount)
                                     ACTIVE_POSITIONS.pop(token, None)
                                     FAILED_EXIT_ATTEMPTS.pop(token, None)
                         else:
@@ -1315,7 +1318,12 @@ def check_holder_distribution(w3: Web3, token: str, max_top_holder_pct: float = 
             except:
                 continue
                 
-        pool = find_or_wait_pool(w3, WETH, token, 3000) or find_or_wait_pool(w3, WETH, token, 10000)
+        pool = None
+        for fee in [100, 500, 3000, 10000]:
+            p = find_or_wait_pool(w3, WETH, token, fee) or find_or_wait_pool(w3, token, WETH, fee)
+            if p:
+                pool = p
+                break
         pool_addr = to_checksum_address(pool) if pool else None
         
         # Filter zero address, pool, and contract itself
@@ -1585,11 +1593,11 @@ def check_malicious_and_copycat_patterns(name: str, symbol: str) -> tuple[bool, 
 def check_cross_pool_arbitrage(w3: Web3, token: str, amount_eth: float = 1.0) -> dict:
     """
     Safety / Arbitrage #6: Check for cross-pool price discrepancies.
-    Compares quotes across 500 (0.05%), 3000 (0.3%), and 10000 (1%) fee tiers.
+    Compares quotes across 100 (0.01%), 500 (0.05%), 3000 (0.3%), and 10000 (1%) fee tiers.
     """
     amount_in = w3.to_wei(amount_eth, 'ether')
     quotes = {}
-    fees = [500, 3000, 10000]
+    fees = [100, 500, 3000, 10000]
     
     for fee in fees:
         try:
@@ -1653,7 +1661,14 @@ def check_token_safety(w3: Web3, token: str, min_liq: float) -> tuple[bool, str]
                 if age < min_age_secs:
                     return False, f"Pool is too new: {age:.1f}s < {min_age_secs}s"
 
-        pool = find_or_wait_pool(w3, WETH, token, 3000) or find_or_wait_pool(w3, WETH, token, 10000)
+        pool = None
+        fee_tier = 3000
+        for fee in [100, 500, 3000, 10000]:
+            p = find_or_wait_pool(w3, WETH, token, fee) or find_or_wait_pool(w3, token, WETH, fee)
+            if p:
+                pool = p
+                fee_tier = fee
+                break
         if not pool:
             return False, "No WETH pool found"
         liq = check_pool_liquidity(w3, pool)
@@ -1665,12 +1680,12 @@ def check_token_safety(w3: Web3, token: str, min_liq: float) -> tuple[bool, str]
         amount_in = w3.to_wei(test_eth, 'ether')
         try:
             # Buy quote
-            buy_out = get_accurate_min_out(w3, token, 3000, amount_in, 1000)
+            buy_out = get_accurate_min_out(w3, token, fee_tier, amount_in, 1000)
             if buy_out < 1:
                 return False, "Honeypot: buy quote 0 or very low"
 
             # Sell quote back
-            sell_out = get_accurate_min_out(w3, WETH, 3000, buy_out, 1000)
+            sell_out = get_accurate_min_out(w3, WETH, fee_tier, buy_out, 1000)
             if sell_out < amount_in * 0.7:  # lose more than 30% on roundtrip -> suspicious
                 return False, f"Honeypot detected: roundtrip loss >30% (got back {sell_out / 1e18} ETH)"
 
@@ -2069,7 +2084,7 @@ def find_best_pool(w3: Web3, token: str) -> tuple[Optional[str], Optional[str], 
     # 1. Query Uniswap V3 pools
     uni_pool = None
     uni_fee = 3000
-    for fee in [3000, 10000, 500]:
+    for fee in [100, 500, 3000, 10000]:
         p = find_or_wait_pool(w3, WETH, token, fee) or find_or_wait_pool(w3, token, WETH, fee)
         if p:
             uni_pool = p
@@ -2641,8 +2656,8 @@ def monitor_new_pools_and_snipe(w3: Web3, buy_amount_eth: float = 0.05, cfg: dic
     flip_alert_sent = activated  # if already true don't spam the flip message
     last_activation_check = time.time()
 
-    # Fixed small amount for automatic meme sniping
-    SNIPE_AMOUNT_ETH = 0.001
+    # Dynamic configurable amount for automatic meme sniping
+    SNIPE_AMOUNT_ETH = float(os.getenv("SNIPE_AMOUNT_ETH", "0.015"))
 
     while True:
         if is_kill_switch_active(cfg.get("KILL_SWITCH_FILE", "")):
@@ -2656,7 +2671,7 @@ def monitor_new_pools_and_snipe(w3: Web3, buy_amount_eth: float = 0.05, cfg: dic
                 activated = check_b20_activated(w3, want_stable=False)
                 last_activation_check = current_time
                 if activated and not flip_alert_sent:
-                    tg_send("🎉 B20 ACTIVATION FLIPPED! Now fully LIVE for real B20 meme sniping (0.001 ETH auto).")
+                    tg_send(f"🎉 B20 ACTIVATION FLIPPED! Now fully LIVE for real B20 meme sniping ({SNIPE_AMOUNT_ETH} ETH auto).")
                     flip_alert_sent = True
             except Exception as act_e:
                 print(f"Activation check error: {act_e}")
@@ -2762,13 +2777,52 @@ def monitor_new_pools_and_snipe(w3: Web3, buy_amount_eth: float = 0.05, cfg: dic
                         # Real automatic snipe with small fixed amount
                         safe, reason = check_token_safety(w3, new_token, cfg.get("MIN_LIQUIDITY_ETH", 5.0))
                         if not safe:
-                            print(f"[SAFETY SKIP] {new_token}: {reason}")
+                            if "Low liquidity" in reason or "No WETH pool found" in reason or "Honeypot sim failed" in reason:
+                                if new_token not in PENDING_POOLS_TO_RETRY:
+                                    print(f"[RETRY QUEUE] Adding {new_token} to retry queue (Reason: {reason})")
+                                    PENDING_POOLS_TO_RETRY[new_token] = {
+                                        'pool': pool,
+                                        'fee': fee,
+                                        'timestamp': time.time(),
+                                        'attempts': 0
+                                    }
+                            else:
+                                print(f"[SAFETY SKIP] {new_token}: {reason}")
                             continue
                         print(f"AUTO SNIPE: Attempting buy {new_token} with {SNIPE_AMOUNT_ETH} ETH (live)")
                         attempt_buy(w3, new_token, fee, SNIPE_AMOUNT_ETH, cfg, max_retries=1)
                         ACTIVE_POSITIONS[new_token] = SNIPE_AMOUNT_ETH  # track stub
                     except Exception as decode_err:
                         print(f"Log decode error: {decode_err}")
+
+                # Process retry queue for 0-liquidity pools
+                retry_tokens = list(PENDING_POOLS_TO_RETRY.keys())
+                for token in retry_tokens:
+                    item = PENDING_POOLS_TO_RETRY[token]
+                    if time.time() - item['timestamp'] > 300 or item['attempts'] >= 20:
+                        print(f"[RETRY QUEUE] Discarding {token} (Timeout or Max attempts reached)")
+                        PENDING_POOLS_TO_RETRY.pop(token, None)
+                        continue
+                    
+                    item['attempts'] += 1
+                    print(f"[RETRY QUEUE] Re-checking {token} (Attempt {item['attempts']}/20)...")
+                    try:
+                        safe_ret, reason_ret = check_token_safety(w3, token, cfg.get("MIN_LIQUIDITY_ETH", 5.0))
+                        if safe_ret:
+                            if len(ACTIVE_POSITIONS) >= MAX_CONCURRENT:
+                                print(f"[RISK] Max concurrent {MAX_CONCURRENT} reached, skipping retry for {token}")
+                                PENDING_POOLS_TO_RETRY.pop(token, None)
+                                continue
+                            print(f"AUTO SNIPE (RETRY SUCCESS): Attempting buy {token} with {SNIPE_AMOUNT_ETH} ETH")
+                            attempt_buy(w3, token, item['fee'], SNIPE_AMOUNT_ETH, cfg, max_retries=1)
+                            ACTIVE_POSITIONS[token] = SNIPE_AMOUNT_ETH
+                            PENDING_POOLS_TO_RETRY.pop(token, None)
+                        else:
+                            if not ("Low liquidity" in reason_ret or "No WETH pool found" in reason_ret or "Honeypot sim failed" in reason_ret):
+                                print(f"[RETRY QUEUE] Discarding {token} due to permanent safety issue: {reason_ret}")
+                                PENDING_POOLS_TO_RETRY.pop(token, None)
+                    except Exception as ret_err:
+                        print(f"[RETRY QUEUE] Error re-checking {token}: {ret_err}")
 
                 last_block = current_block
 
