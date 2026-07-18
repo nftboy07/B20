@@ -2658,7 +2658,7 @@ def monitor_new_pools_and_snipe(w3: Web3, buy_amount_eth: float = 0.05, cfg: dic
 
     # Dynamic configurable amounts for automatic sniping
     SNIPE_AMOUNT_ETH = float(os.getenv("SNIPE_AMOUNT_ETH", "0.015"))
-    SNIPE_AMOUNT_O1_ETH = float(os.getenv("SNIPE_AMOUNT_O1_ETH", str(SNIPE_AMOUNT_ETH)))
+    SNIPE_AMOUNT_O1_ETH = float(os.getenv("SNIPE_AMOUNT_O1_ETH", "0.001"))
     SNIPE_AMOUNT_CC0_ETH = float(os.getenv("SNIPE_AMOUNT_CC0_ETH", "0.001"))
 
     while True:
