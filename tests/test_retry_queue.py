@@ -78,5 +78,43 @@ class TestRetryQueue(unittest.TestCase):
         # Verify fee tiers lists contain 100
         self.assertIn(100, b20_mainnet_sniper.UNISWAP_FEE_TIERS)
 
+    def test_launchpad_filtering_logic(self):
+        # Helper to simulate our launchpad filter block
+        def is_allowed(token, cfg):
+            is_o1 = token.lower().endswith("01")
+            is_cc0 = token.lower().endswith("cc0")
+            if cfg.get("ONLY_O1_LAUNCHPAD", False) or cfg.get("ONLY_CC0_LAUNCHPAD", False):
+                allowed_launchpad = False
+                if cfg.get("ONLY_O1_LAUNCHPAD", False) and is_o1:
+                    allowed_launchpad = True
+                if cfg.get("ONLY_CC0_LAUNCHPAD", False) and is_cc0:
+                    allowed_launchpad = True
+                return allowed_launchpad
+            return True
+
+        # Case 1: Only o1 enabled
+        cfg1 = {"ONLY_O1_LAUNCHPAD": True, "ONLY_CC0_LAUNCHPAD": False}
+        self.assertTrue(is_allowed("0xabcdef01", cfg1))
+        self.assertFalse(is_allowed("0xabcdefcc0", cfg1))
+        self.assertFalse(is_allowed("0xabcdef00", cfg1))
+
+        # Case 2: Only cc0 enabled
+        cfg2 = {"ONLY_O1_LAUNCHPAD": False, "ONLY_CC0_LAUNCHPAD": True}
+        self.assertFalse(is_allowed("0xabcdef01", cfg2))
+        self.assertTrue(is_allowed("0xabcdefcc0", cfg2))
+        self.assertFalse(is_allowed("0xabcdef00", cfg2))
+
+        # Case 3: Both enabled
+        cfg3 = {"ONLY_O1_LAUNCHPAD": True, "ONLY_CC0_LAUNCHPAD": True}
+        self.assertTrue(is_allowed("0xabcdef01", cfg3))
+        self.assertTrue(is_allowed("0xabcdefcc0", cfg3))
+        self.assertFalse(is_allowed("0xabcdef00", cfg3))
+
+        # Case 4: Neither enabled (any token allowed)
+        cfg4 = {"ONLY_O1_LAUNCHPAD": False, "ONLY_CC0_LAUNCHPAD": False}
+        self.assertTrue(is_allowed("0xabcdef01", cfg4))
+        self.assertTrue(is_allowed("0xabcdefcc0", cfg4))
+        self.assertTrue(is_allowed("0xabcdef00", cfg4))
+
 if __name__ == "__main__":
     unittest.main()

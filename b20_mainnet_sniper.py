@@ -2733,9 +2733,17 @@ def monitor_new_pools_and_snipe(w3: Web3, buy_amount_eth: float = 0.05, cfg: dic
 
                         if new_token.lower().startswith("0xb20") or is_b20:
                             is_o1 = new_token.lower().endswith("01")
-                            if cfg.get("ONLY_O1_LAUNCHPAD", False) and not is_o1:
-                                print(f"[O1 FILTER] Token {new_token} does not end with 01. Skipping as ONLY_O1_LAUNCHPAD is active.")
-                                continue
+                            is_cc0 = new_token.lower().endswith("cc0")
+                            
+                            if cfg.get("ONLY_O1_LAUNCHPAD", False) or cfg.get("ONLY_CC0_LAUNCHPAD", False):
+                                allowed_launchpad = False
+                                if cfg.get("ONLY_O1_LAUNCHPAD", False) and is_o1:
+                                    allowed_launchpad = True
+                                if cfg.get("ONLY_CC0_LAUNCHPAD", False) and is_cc0:
+                                    allowed_launchpad = True
+                                if not allowed_launchpad:
+                                    print(f"[LAUNCHPAD FILTER] Token {new_token} is not from an enabled launchpad. Skipping.")
+                                    continue
 
                             name, sym = get_token_name_symbol(w3, new_token)
                             meme = is_meme_like(name, sym)
@@ -2746,7 +2754,9 @@ def monitor_new_pools_and_snipe(w3: Web3, buy_amount_eth: float = 0.05, cfg: dic
                             print(f"Initial liquidity add for {new_token}: {initial_liq} (pool {pool})")
 
                             o1_tag = " ⚖️ <b>[o1.exchange Launchpad]</b>" if is_o1 else ""
-                            msg = f"🆕 <b>{name} ({sym})</b>{o1_tag}\n<code>{new_token}</code>\nPool: <code>{pool}</code> fee={fee} liq={initial_liq} {'[MEME]' if meme else ''}"
+                            cc0_tag = " 🎨 <b>[cc0.company Launchpad]</b>" if is_cc0 else ""
+                            tag = o1_tag + cc0_tag
+                            msg = f"🆕 <b>{name} ({sym})</b>{tag}\n<code>{new_token}</code>\nPool: <code>{pool}</code> fee={fee} liq={initial_liq} {'[MEME]' if meme else ''}"
 
                             buttons = get_buy_keyboard_dict(new_token) if TG_LIB_AVAILABLE else {
                                 "inline_keyboard": [
@@ -2963,12 +2973,19 @@ def main():
                         print("[MEMPOOL] Could not predict token address for B20 transaction.")
                         return
                     is_o1 = predicted.lower().endswith("01")
-                    if cfg.get("ONLY_O1_LAUNCHPAD", False) and not is_o1:
-                        print(f"[O1 FILTER] Predicted token {predicted} does not end with 01. Skipping mempool snipe.")
-                        return
-                    tag = " [o1.exchange Launchpad]" if is_o1 else ""
+                    is_cc0 = predicted.lower().endswith("cc0")
+                    if cfg.get("ONLY_O1_LAUNCHPAD", False) or cfg.get("ONLY_CC0_LAUNCHPAD", False):
+                        allowed_launchpad = False
+                        if cfg.get("ONLY_O1_LAUNCHPAD", False) and is_o1:
+                            allowed_launchpad = True
+                        if cfg.get("ONLY_CC0_LAUNCHPAD", False) and is_cc0:
+                            allowed_launchpad = True
+                        if not allowed_launchpad:
+                            print(f"[LAUNCHPAD FILTER] Predicted token {predicted} is not from an enabled launchpad. Skipping mempool snipe.")
+                            return
+                    tag = " [o1.exchange Launchpad]" if is_o1 else (" [cc0.company Launchpad]" if is_cc0 else "")
                     msg = f"🆕 <b>{name}</b> (MEMPOOL EARLY){tag}\nPredicting token: <code>{predicted}</code>"
-                    print(f"[MEMPOOL] Detected pending B20 creation for token {predicted}{' (o1.exchange Launchpad)' if is_o1 else ''}")
+                    print(f"[MEMPOOL] Detected pending B20 creation for token {predicted}{tag}")
                     buttons = get_buy_keyboard_dict(predicted) if TG_LIB_AVAILABLE else {
                         "inline_keyboard": [
                             [{"text": "0.003 ETH", "callback_data": f"buy_{predicted}_0.003"},
