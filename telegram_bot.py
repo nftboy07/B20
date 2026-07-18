@@ -34,6 +34,52 @@ except Exception:
 
 load_dotenv()
 
+import requests
+
+class DeBankClient:
+    def __init__(self, access_key: str = None):
+        self.access_key = access_key or os.getenv("DEBANK_ACCESS_KEY", "e59adf0fae2212ca38d1bb8324feb9af3287b3dc")
+        self.base_url = "https://pro-openapi.debank.com"
+        
+    def _request(self, endpoint: str, params: dict = None) -> dict:
+        if not self.access_key:
+            print("[DEBANK] Error: No AccessKey configured.")
+            return None
+        headers = {
+            "accept": "application/json",
+            "AccessKey": self.access_key
+        }
+        url = f"{self.base_url}{endpoint}"
+        try:
+            resp = requests.get(url, headers=headers, params=params, timeout=10)
+            if resp.status_code == 200:
+                return resp.json()
+            else:
+                print(f"[DEBANK ERROR] Status {resp.status_code}: {resp.text}")
+                return None
+        except Exception as e:
+            print(f"[DEBANK EXCEPTION] {e}")
+            return None
+
+    def get_total_balance(self, address: str) -> dict:
+        return self._request("/v1/user/total_balance", {"id": address})
+
+    def get_token_list(self, address: str, chain_id: str = "base", is_all: bool = True) -> list:
+        res = self._request("/v1/user/token_list", {"id": address, "chain_id": chain_id, "is_all": str(is_all).lower()})
+        return res if isinstance(res, list) else []
+
+    def get_token_price(self, token_address: str, chain_id: str = "base") -> float:
+        res = self._request("/v1/token", {"id": token_address, "chain_id": chain_id})
+        if res and "price" in res:
+            return float(res["price"])
+        return None
+
+    def get_eth_price_usd(self) -> float:
+        price = self.get_token_price("0x4200000000000000000000000000000000000006", "base")
+        if price:
+            return price
+        return 3500.0  # sensible fallback
+
 # --- Config resolution (ethbot style) ---
 def _get_token() -> str:
     return (
@@ -157,13 +203,14 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /buy <token> <eth>    /sell <token> [25|50|100|all]
 /positions
 
-**Balances & Info (live on-chain)**
+**Balances & Info (live on-chain & DeBank)**
 /balance <token>   /ethbalance /wallet
 /price <token>     /token <token>
 /liq <token>       /pools <token>
 /gas               /simulate <token> <eth>
 /safety <token>    /perftoken <token>
 /activation        /rpc
+/debank [addr]     /portfolio [addr]
 
 **Analytics & History**
 /pnl /spent /value /summary /stats /profit <token>
@@ -432,7 +479,7 @@ async def address_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("No w3 context.")
 
 async def price_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Real mainnet price (QuoterV2 or slot0) in ETH per token."""
+    """Real mainnet price (QuoterV2 or slot0) in ETH per token with DeBank USD fallback."""
     args = context.args or []
     if not args:
         await update.message.reply_text("Usage: /price <token>")
@@ -441,16 +488,48 @@ async def price_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     use_w3 = _get_w3()
     if use_w3:
         try:
+            token_checksum = to_checksum_address(token)
             from b20_mainnet_sniper import get_token_price_in_eth, get_token_decimals
+            
+            # 1. Try On-chain Quoter
             def _get_price():
-                price = get_token_price_in_eth(use_w3, token)
-                dec = get_token_decimals(use_w3, token)
-                return price, dec
+                try:
+                    price = get_token_price_in_eth(use_w3, token_checksum)
+                    dec = get_token_decimals(use_w3, token_checksum)
+                    return price, dec
+                except Exception as e:
+                    print(f"[PRICE ONCHAIN ERR] {e}")
+                    return 0.0, 18
             price, dec = await asyncio.to_thread(_get_price)
+            
+            # 2. Try DeBank API
+            client = DeBankClient()
+            def _get_debank_price():
+                try:
+                    usd_price = client.get_token_price(token_checksum, "base")
+                    eth_price_usd = client.get_eth_price_usd()
+                    return usd_price, eth_price_usd
+                except Exception as e:
+                    print(f"[PRICE DEBANK ERR] {e}")
+                    return None, None
+            usd_price, eth_price_usd = await asyncio.to_thread(_get_debank_price)
+            
+            msg = f"Price info for {token[:10]}... :\n\n"
+            
             if price > 0:
-                await update.message.reply_text(f"💰 Price {token[:10]}... : {price:.10f} ETH per token\n(dec={dec})")
+                msg += f"⛓️ <b>On-chain:</b> {price:.10f} ETH per token\n"
             else:
-                await update.message.reply_text(f"Price {token[:10]}... : {price} ETH (0 = no liq/Quoter yet or very new pool)\n(dec={dec})\nTry again after more buys or use /pools")
+                msg += f"⛓️ <b>On-chain:</b> N/A (no liquidity pool / quoter yet)\n"
+                
+            if usd_price is not None:
+                debank_eth_price = usd_price / eth_price_usd if eth_price_usd else 0.0
+                msg += f"📊 <b>DeBank:</b> ${usd_price:,.6f} USD (~ {debank_eth_price:.10f} ETH)\n"
+                msg += f"💎 <b>ETH Price:</b> ${eth_price_usd:,.2f} USD\n"
+            else:
+                msg += f"📊 <b>DeBank:</b> N/A (AccessKey not configured or token not indexed)\n"
+                
+            await update.message.reply_html(msg)
+            
         except Exception as e:
             await update.message.reply_text(f"Price error: {e}")
     else:
@@ -484,6 +563,87 @@ async def token_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"Token info error: {e}")
     else:
         await update.message.reply_text("No w3 context.")
+
+async def debank_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show user portfolio and token balances using DeBank API."""
+    use_w3 = _get_w3()
+    if not use_w3:
+        await update.message.reply_text("No w3 context.")
+        return
+        
+    senders = _get_senders(use_w3)
+    args = context.args or []
+    
+    # If the user specifies an address, check that address instead of the default bot wallets
+    if args:
+        try:
+            target_addresses = [to_checksum_address(args[0])]
+        except Exception:
+            await update.message.reply_text("Invalid wallet address provided.")
+            return
+    else:
+        target_addresses = senders
+        
+    if not target_addresses:
+        await update.message.reply_text("No wallets configured.")
+        return
+        
+    client = DeBankClient()
+    
+    await update.message.reply_text("🔍 Fetching portfolio from DeBank...")
+    
+    for addr in target_addresses:
+        try:
+            # 1. Total Balance / Net Worth
+            bal_data = await asyncio.to_thread(client.get_total_balance, addr)
+            total_usd = 0.0
+            chain_breakdown = []
+            if bal_data:
+                total_usd = bal_data.get("total_usd_value", 0.0)
+                for item in bal_data.get("chain_list", []):
+                    usd_val = item.get("usd_value", 0.0)
+                    if usd_val > 0.01:
+                        chain_breakdown.append(f"- {item.get('name', item.get('id', 'Unknown'))}: ${usd_val:,.2f}")
+            
+            # 2. Token List on Base chain
+            tokens = await asyncio.to_thread(client.get_token_list, addr, "base", True)
+            
+            msg = f"💳 <b>Wallet Portfolio:</b> <code>{addr}</code>\n"
+            msg += f"💰 <b>Total Net Worth:</b> ${total_usd:,.2f} USD\n\n"
+            
+            if chain_breakdown:
+                msg += "🌐 <b>Chain Assets:</b>\n" + "\n".join(chain_breakdown) + "\n\n"
+                
+            msg += "🔵 <b>Base Chain Tokens:</b>\n"
+            base_tokens = []
+            for t in tokens:
+                amount = t.get("amount", 0.0)
+                price = t.get("price", 0.0)
+                value = amount * price
+                if value > 0.01 or amount > 0:
+                    base_tokens.append({
+                        "symbol": t.get("symbol", "UNK"),
+                        "amount": amount,
+                        "price": price,
+                        "value": value,
+                        "address": t.get("id", "")
+                    })
+            
+            # Sort by USD value descending
+            base_tokens = sorted(base_tokens, key=lambda x: x["value"], reverse=True)
+            
+            if base_tokens:
+                for bt in base_tokens[:25]:  # Limit to top 25 to fit in a single message
+                    msg += f"• <b>{bt['symbol']}</b>: {bt['amount']:.4f} (${bt['price']:,.4f}) -> <b>${bt['value']:,.2f}</b>\n"
+                    if bt["address"] and bt["address"] != "base":
+                        msg += f"  <code>{bt['address']}</code>\n"
+            else:
+                msg += "No tokens found on Base chain.\n"
+                
+            await update.message.reply_html(msg)
+            
+        except Exception as e:
+            await update.message.reply_text(f"DeBank query failed for {addr}: {e}")
 
 async def ethbalance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Real mainnet ETH balance of all bot wallets."""
@@ -1587,6 +1747,8 @@ def _build_application(token: str) -> Application:
     app.add_handler(CommandHandler("summary", summary_cmd))
     app.add_handler(CommandHandler("profit", profit_cmd))
     app.add_handler(CommandHandler("checkprofit", profit_cmd))
+    app.add_handler(CommandHandler("debank", debank_cmd))
+    app.add_handler(CommandHandler("portfolio", debank_cmd))
 
     # Inline buttons
     app.add_handler(CallbackQueryHandler(button_callback))

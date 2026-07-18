@@ -131,5 +131,47 @@ class TestRetryQueue(unittest.TestCase):
         self.assertEqual(get_amount("0xabcdefcc0"), 0.001)
         self.assertEqual(get_amount("0xabcdef99"), 0.015)
 
+    @patch('requests.get')
+    def test_debank_client_flow(self, mock_get):
+        from telegram_bot import DeBankClient
+        client = DeBankClient(access_key="test-key")
+        self.assertEqual(client.access_key, "test-key")
+
+        # Mock total balance API call
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "total_usd_value": 1500.50,
+            "chain_list": [{"id": "base", "name": "Base", "usd_value": 1500.50}]
+        }
+        mock_get.return_value = mock_response
+
+        bal = client.get_total_balance("0x1234")
+        self.assertEqual(bal["total_usd_value"], 1500.50)
+        self.assertEqual(bal["chain_list"][0]["name"], "Base")
+
+        # Mock token list API call
+        mock_response_list = MagicMock()
+        mock_response_list.status_code = 200
+        mock_response_list.json.return_value = [
+            {"id": "base", "symbol": "ETH", "amount": 0.5, "price": 3000.0}
+        ]
+        mock_get.return_value = mock_response_list
+
+        tokens = client.get_token_list("0x1234", "base")
+        self.assertEqual(len(tokens), 1)
+        self.assertEqual(tokens[0]["symbol"], "ETH")
+        self.assertEqual(tokens[0]["price"], 3000.0)
+
+        # Mock token details call
+        mock_response_detail = MagicMock()
+        mock_response_detail.status_code = 200
+        mock_response_detail.json.return_value = {"price": 1.25}
+        mock_get.return_value = mock_response_detail
+
+        price = client.get_token_price("0xabc", "base")
+        self.assertEqual(price, 1.25)
+
 if __name__ == "__main__":
+    from unittest.mock import patch, MagicMock
     unittest.main()
