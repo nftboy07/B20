@@ -2656,8 +2656,10 @@ def monitor_new_pools_and_snipe(w3: Web3, buy_amount_eth: float = 0.05, cfg: dic
     flip_alert_sent = activated  # if already true don't spam the flip message
     last_activation_check = time.time()
 
-    # Dynamic configurable amount for automatic meme sniping
+    # Dynamic configurable amounts for automatic sniping
     SNIPE_AMOUNT_ETH = float(os.getenv("SNIPE_AMOUNT_ETH", "0.015"))
+    SNIPE_AMOUNT_O1_ETH = float(os.getenv("SNIPE_AMOUNT_O1_ETH", str(SNIPE_AMOUNT_ETH)))
+    SNIPE_AMOUNT_CC0_ETH = float(os.getenv("SNIPE_AMOUNT_CC0_ETH", "0.001"))
 
     while True:
         if is_kill_switch_active(cfg.get("KILL_SWITCH_FILE", "")):
@@ -2671,7 +2673,10 @@ def monitor_new_pools_and_snipe(w3: Web3, buy_amount_eth: float = 0.05, cfg: dic
                 activated = check_b20_activated(w3, want_stable=False)
                 last_activation_check = current_time
                 if activated and not flip_alert_sent:
-                    tg_send(f"🎉 B20 ACTIVATION FLIPPED! Now fully LIVE for real B20 meme sniping ({SNIPE_AMOUNT_ETH} ETH auto).")
+                    tg_send(
+                        f"🎉 B20 ACTIVATION FLIPPED! Now fully LIVE for real B20 meme sniping.\n"
+                        f"Target sizes: o1.exchange = {SNIPE_AMOUNT_O1_ETH} ETH, cc0.company = {SNIPE_AMOUNT_CC0_ETH} ETH"
+                    )
                     flip_alert_sent = True
             except Exception as act_e:
                 print(f"Activation check error: {act_e}")
@@ -2720,6 +2725,10 @@ def monitor_new_pools_and_snipe(w3: Web3, buy_amount_eth: float = 0.05, cfg: dic
                         if new_token not in POOL_DETECTION_TIMES:
                             POOL_DETECTION_TIMES[new_token] = time.time()
 
+                        if new_token in BLACKLIST:
+                            print(f"[BLACKLIST] Skipping {new_token}")
+                            continue
+
                         is_b20 = False
                         try:
                             fac = get_b20_factory(w3)
@@ -2727,54 +2736,57 @@ def monitor_new_pools_and_snipe(w3: Web3, buy_amount_eth: float = 0.05, cfg: dic
                         except Exception:
                             pass
 
-                        if new_token in BLACKLIST:
-                            print(f"[BLACKLIST] Skipping {new_token}")
+                        if not (new_token.lower().startswith("0xb20") or is_b20):
+                            print(f"[B20 FILTER] Token {new_token} is not a B20 token. Skipping.")
                             continue
 
-                        if new_token.lower().startswith("0xb20") or is_b20:
-                            is_o1 = new_token.lower().endswith("01")
-                            is_cc0 = new_token.lower().endswith("cc0")
-                            
-                            if cfg.get("ONLY_O1_LAUNCHPAD", False) or cfg.get("ONLY_CC0_LAUNCHPAD", False):
-                                allowed_launchpad = False
-                                if cfg.get("ONLY_O1_LAUNCHPAD", False) and is_o1:
-                                    allowed_launchpad = True
-                                if cfg.get("ONLY_CC0_LAUNCHPAD", False) and is_cc0:
-                                    allowed_launchpad = True
-                                if not allowed_launchpad:
-                                    print(f"[LAUNCHPAD FILTER] Token {new_token} is not from an enabled launchpad. Skipping.")
-                                    continue
+                        is_o1 = new_token.lower().endswith("01")
+                        is_cc0 = new_token.lower().endswith("cc0")
+                        
+                        if cfg.get("ONLY_O1_LAUNCHPAD", False) or cfg.get("ONLY_CC0_LAUNCHPAD", False):
+                            allowed_launchpad = False
+                            if cfg.get("ONLY_O1_LAUNCHPAD", False) and is_o1:
+                                allowed_launchpad = True
+                            if cfg.get("ONLY_CC0_LAUNCHPAD", False) and is_cc0:
+                                allowed_launchpad = True
+                            if not allowed_launchpad:
+                                print(f"[LAUNCHPAD FILTER] Token {new_token} is not from an enabled launchpad. Skipping.")
+                                continue
 
-                            name, sym = get_token_name_symbol(w3, new_token)
-                            meme = is_meme_like(name, sym)
-                            print(f"Detected likely B20 token: {new_token} (isB20={is_b20}, meme_like={meme})")
+                        name, sym = get_token_name_symbol(w3, new_token)
+                        meme = is_meme_like(name, sym)
+                        print(f"Detected likely B20 token: {new_token} (isB20={is_b20}, meme_like={meme})")
 
-                            # Upgrade #4: watch for initial liquidity adds with exact amounts
-                            initial_liq = check_pool_liquidity(w3, pool)
-                            print(f"Initial liquidity add for {new_token}: {initial_liq} (pool {pool})")
+                        # Upgrade #4: watch for initial liquidity adds with exact amounts
+                        initial_liq = check_pool_liquidity(w3, pool)
+                        print(f"Initial liquidity add for {new_token}: {initial_liq} (pool {pool})")
 
-                            o1_tag = " ⚖️ <b>[o1.exchange Launchpad]</b>" if is_o1 else ""
-                            cc0_tag = " 🎨 <b>[cc0.company Launchpad]</b>" if is_cc0 else ""
-                            tag = o1_tag + cc0_tag
-                            msg = f"🆕 <b>{name} ({sym})</b>{tag}\n<code>{new_token}</code>\nPool: <code>{pool}</code> fee={fee} liq={initial_liq} {'[MEME]' if meme else ''}"
+                        o1_tag = " ⚖️ <b>[o1.exchange Launchpad]</b>" if is_o1 else ""
+                        cc0_tag = " 🎨 <b>[cc0.company Launchpad]</b>" if is_cc0 else ""
+                        tag = o1_tag + cc0_tag
+                        msg = f"🆕 <b>{name} ({sym})</b>{tag}\n<code>{new_token}</code>\nPool: <code>{pool}</code> fee={fee} liq={initial_liq} {'[MEME]' if meme else ''}"
 
-                            buttons = get_buy_keyboard_dict(new_token) if TG_LIB_AVAILABLE else {
-                                "inline_keyboard": [
-                                    [{"text": "0.003 ETH", "callback_data": f"buy_{new_token}_0.003"},
-                                     {"text": "0.005 ETH", "callback_data": f"buy_{new_token}_0.005"}],
-                                    [{"text": "0.007 ETH", "callback_data": f"buy_{new_token}_0.007"},
-                                     {"text": "0.01 ETH", "callback_data": f"buy_{new_token}_0.01"}],
-                                ]
-                            }
-                            tg_send(msg, reply_markup=buttons)
+                        buttons = get_buy_keyboard_dict(new_token) if TG_LIB_AVAILABLE else {
+                            "inline_keyboard": [
+                                [{"text": "0.001 ETH", "callback_data": f"buy_{new_token}_0.001"},
+                                 {"text": "0.003 ETH", "callback_data": f"buy_{new_token}_0.003"},
+                                 {"text": "0.005 ETH", "callback_data": f"buy_{new_token}_0.005"}],
+                                [{"text": "0.007 ETH", "callback_data": f"buy_{new_token}_0.007"},
+                                 {"text": "0.01 ETH", "callback_data": f"buy_{new_token}_0.01"},
+                                 {"text": "0.015 ETH", "callback_data": f"buy_{new_token}_0.015"}],
+                            ]
+                        }
+                        tg_send(msg, reply_markup=buttons)
 
-                            # Upgrade #5: prefer meme-like for auto snipe priority (log for now)
-                            if meme:
-                                print(f"[MEME FILTER] {new_token} looks like a meme - prioritizing")
+                        # Upgrade #5: prefer meme-like for auto snipe priority (log for now)
+                        if meme:
+                            print(f"[MEME FILTER] {new_token} looks like a meme - prioritizing")
+
+                        buy_amt = SNIPE_AMOUNT_CC0_ETH if is_cc0 else (SNIPE_AMOUNT_O1_ETH if is_o1 else SNIPE_AMOUNT_ETH)
 
                         # Automatic small amount sniping - no pool alerts
                         if dry_run or not activated:
-                            print(f"[{'DRY RUN' if dry_run else 'WAITING ACTIVATION'}] Would snipe {new_token} with {SNIPE_AMOUNT_ETH} ETH")
+                            print(f"[{'DRY RUN' if dry_run else 'WAITING ACTIVATION'}] Would snipe {new_token} with {buy_amt} ETH")
                             liq = check_pool_liquidity(w3, pool)
                             print(f"[{'DRY' if dry_run else 'WAIT'}] liquidity() = {liq}")
                             continue
@@ -2799,9 +2811,9 @@ def monitor_new_pools_and_snipe(w3: Web3, buy_amount_eth: float = 0.05, cfg: dic
                             else:
                                 print(f"[SAFETY SKIP] {new_token}: {reason}")
                             continue
-                        print(f"AUTO SNIPE: Attempting buy {new_token} with {SNIPE_AMOUNT_ETH} ETH (live)")
-                        attempt_buy(w3, new_token, fee, SNIPE_AMOUNT_ETH, cfg, max_retries=1)
-                        ACTIVE_POSITIONS[new_token] = SNIPE_AMOUNT_ETH  # track stub
+                        print(f"AUTO SNIPE: Attempting buy {new_token} with {buy_amt} ETH (live)")
+                        attempt_buy(w3, new_token, fee, buy_amt, cfg, max_retries=1)
+                        ACTIVE_POSITIONS[new_token] = buy_amt  # track stub
                     except Exception as decode_err:
                         print(f"Log decode error: {decode_err}")
 
@@ -2814,6 +2826,10 @@ def monitor_new_pools_and_snipe(w3: Web3, buy_amount_eth: float = 0.05, cfg: dic
                         PENDING_POOLS_TO_RETRY.pop(token, None)
                         continue
                     
+                    is_o_retry = token.lower().endswith("01")
+                    is_cc_retry = token.lower().endswith("cc0")
+                    buy_amt = SNIPE_AMOUNT_CC0_ETH if is_cc_retry else (SNIPE_AMOUNT_O1_ETH if is_o_retry else SNIPE_AMOUNT_ETH)
+
                     item['attempts'] += 1
                     print(f"[RETRY QUEUE] Re-checking {token} (Attempt {item['attempts']}/20)...")
                     try:
@@ -2823,9 +2839,9 @@ def monitor_new_pools_and_snipe(w3: Web3, buy_amount_eth: float = 0.05, cfg: dic
                                 print(f"[RISK] Max concurrent {MAX_CONCURRENT} reached, skipping retry for {token}")
                                 PENDING_POOLS_TO_RETRY.pop(token, None)
                                 continue
-                            print(f"AUTO SNIPE (RETRY SUCCESS): Attempting buy {token} with {SNIPE_AMOUNT_ETH} ETH")
-                            attempt_buy(w3, token, item['fee'], SNIPE_AMOUNT_ETH, cfg, max_retries=1)
-                            ACTIVE_POSITIONS[token] = SNIPE_AMOUNT_ETH
+                            print(f"AUTO SNIPE (RETRY SUCCESS): Attempting buy {token} with {buy_amt} ETH")
+                            attempt_buy(w3, token, item['fee'], buy_amt, cfg, max_retries=1)
+                            ACTIVE_POSITIONS[token] = buy_amt
                             PENDING_POOLS_TO_RETRY.pop(token, None)
                         else:
                             if not ("Low liquidity" in reason_ret or "No WETH pool found" in reason_ret or "Honeypot sim failed" in reason_ret):
@@ -2988,16 +3004,19 @@ def main():
                     print(f"[MEMPOOL] Detected pending B20 creation for token {predicted}{tag}")
                     buttons = get_buy_keyboard_dict(predicted) if TG_LIB_AVAILABLE else {
                         "inline_keyboard": [
-                            [{"text": "0.003 ETH", "callback_data": f"buy_{predicted}_0.003"},
+                            [{"text": "0.001 ETH", "callback_data": f"buy_{predicted}_0.001"},
+                             {"text": "0.003 ETH", "callback_data": f"buy_{predicted}_0.003"},
                              {"text": "0.005 ETH", "callback_data": f"buy_{predicted}_0.005"}],
                             [{"text": "0.007 ETH", "callback_data": f"buy_{predicted}_0.007"},
-                             {"text": "0.01 ETH", "callback_data": f"buy_{predicted}_0.01"}],
+                             {"text": "0.01 ETH", "callback_data": f"buy_{predicted}_0.01"},
+                             {"text": "0.015 ETH", "callback_data": f"buy_{predicted}_0.015"}],
                         ]
                     }
                     tg_send(msg, reply_markup=buttons)
                     if not dry_run:
-                        print(f"[MEMPOOL] Triggering early snipe buy attempt for token {predicted}...")
-                        attempt_buy(w3, predicted, 3000, 0.001, cfg)
+                        buy_amt = SNIPE_AMOUNT_CC0_ETH if is_cc0 else (SNIPE_AMOUNT_O1_ETH if is_o1 else SNIPE_AMOUNT_ETH)
+                        print(f"[MEMPOOL] Triggering early snipe buy attempt for token {predicted} with {buy_amt} ETH...")
+                        attempt_buy(w3, predicted, 3000, buy_amt, cfg)
                 ws_url = os.getenv("WEBSOCKET_RPC") or os.getenv("WS_RPC") or cfg.get("RPC_URL", "wss://base-mainnet.public.blastapi.io").replace("https://", "wss://")
                 if "mainnet.base.org" in ws_url:
                     ws_url = "wss://base.publicnode.com"

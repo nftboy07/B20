@@ -1658,12 +1658,14 @@ def get_control_keyboard() -> InlineKeyboardMarkup:
 def get_buy_keyboard(token_address: str) -> InlineKeyboardMarkup:
     keyboard = [
         [
+            InlineKeyboardButton("0.001 ETH", callback_data=f"buy_{token_address}_0.001"),
             InlineKeyboardButton("0.003 ETH", callback_data=f"buy_{token_address}_0.003"),
             InlineKeyboardButton("0.005 ETH", callback_data=f"buy_{token_address}_0.005"),
         ],
         [
             InlineKeyboardButton("0.007 ETH", callback_data=f"buy_{token_address}_0.007"),
             InlineKeyboardButton("0.01 ETH", callback_data=f"buy_{token_address}_0.01"),
+            InlineKeyboardButton("0.015 ETH", callback_data=f"buy_{token_address}_0.015"),
         ],
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -1674,12 +1676,14 @@ def get_buy_keyboard_dict(token_address: str) -> dict:
     return {
         "inline_keyboard": [
             [
+                {"text": "0.001 ETH", "callback_data": f"buy_{token_address}_0.001"},
                 {"text": "0.003 ETH", "callback_data": f"buy_{token_address}_0.003"},
                 {"text": "0.005 ETH", "callback_data": f"buy_{token_address}_0.005"},
             ],
             [
                 {"text": "0.007 ETH", "callback_data": f"buy_{token_address}_0.007"},
                 {"text": "0.01 ETH", "callback_data": f"buy_{token_address}_0.01"},
+                {"text": "0.015 ETH", "callback_data": f"buy_{token_address}_0.015"},
             ],
         ]
     }

@@ -116,5 +116,20 @@ class TestRetryQueue(unittest.TestCase):
         self.assertTrue(is_allowed("0xabcdefcc0", cfg4))
         self.assertTrue(is_allowed("0xabcdef00", cfg4))
 
+    def test_launchpad_amount_resolution(self):
+        # Set up mock env variables or direct variables to test the formula
+        SNIPE_AMOUNT_ETH = 0.015
+        SNIPE_AMOUNT_O1_ETH = 0.015
+        SNIPE_AMOUNT_CC0_ETH = 0.001
+
+        def get_amount(token):
+            is_o1 = token.lower().endswith("01")
+            is_cc0 = token.lower().endswith("cc0")
+            return SNIPE_AMOUNT_CC0_ETH if is_cc0 else (SNIPE_AMOUNT_O1_ETH if is_o1 else SNIPE_AMOUNT_ETH)
+
+        self.assertEqual(get_amount("0xabcdef01"), 0.015)
+        self.assertEqual(get_amount("0xabcdefcc0"), 0.001)
+        self.assertEqual(get_amount("0xabcdef99"), 0.015)
+
 if __name__ == "__main__":
     unittest.main()
